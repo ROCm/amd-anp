@@ -35,7 +35,13 @@
 #include "anp_ibvwrap.h"
 #include "anp_param.h"
 #include "anp_state.h"
+
+
+#ifdef NCCL_BUILD_ENABLED
+#include "nccl_net.h"
+#else
 #include "mpi.h"
+#endif
 
 extern "C" {
 #include "infiniband/ionic_dv.h"
@@ -44,7 +50,9 @@ extern "C" {
 extern void *anp_rccl_bootstrap_handler(void *arg);
 
 #define ENABLE_TIMER 0
+#ifndef NCCL_BUILD_ENABLED
 #define NCCL_NET_PLUGIN_SYMBOL ncclNetPlugin_v8
+#endif
 
 #define MAXNAMESIZE 64
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -57,7 +65,9 @@ bool   anp_state::anp_debug_enable = false;
 anp_log_level_e anp_logger::log_level = LOG_ERROR;
 std::atomic<int> active_threads(0);
 
+#ifndef NCCL_BUILD_ENABLED
 thread_local int ncclDebugNoWarn = 1;
+#endif
 
 struct ncclIbMr {
   uintptr_t addr;
@@ -122,7 +132,9 @@ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 
 pthread_t ncclIbAsyncThread;
+#ifndef NCCL_BUILD_ENABLED
 struct allocationTracker allocTracker[MAX_ALLOC_TRACK_NGPU] = {};
+#endif
 
 void* json_thread_init(void* arg) {
     ANP_LOG_VERBOSE("Process ID: %d, Thread ID: %lu", getpid(), pthread_self());
@@ -585,6 +597,7 @@ void do_host_level_bootstrapping(bool is_root, const char *root_ip, int total_ho
     return;
 }
 
+#ifndef NCCL_BUILD_ENABLED
 void do_bootstrap() {
     int local_rank;
     int global_rank;
@@ -644,9 +657,14 @@ void do_bootstrap() {
    MPI_Barrier(local_comm);
    WARN("continue regular processing for rank [%d]", global_rank);
 }
+#endif
 
 // Plugin implementations of the required functions
-ncclResult_t anpNetInit(ncclDebugLogger_t logFunction) {
+ncclResult_t anpNetInit(ncclDebugLogger_t logFunction
+#ifdef NCCL_BUILD_ENABLED
+                        , ncclProfilerCallback_t profFunction
+#endif
+                        ) {
   ncclResult_t ret;
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
@@ -878,7 +896,9 @@ ncclResult_t anpNetGetProperties(int dev, ncclNetProperties_t* props) {
   if (ncclIbGdrSupport() == ncclSuccess) {
     props->ptrSupport |= NCCL_PTR_CUDA; // GDR support via nv_peermem
   }
+#ifndef NCCL_BUILD_ENABLED
   props->regIsGlobal = 1;
+#endif
   if (ncclIbDmaBufSupport(dev) == ncclSuccess) {
     props->ptrSupport |= NCCL_PTR_DMABUF; // GDR support via DMA-BUF
   }
@@ -886,8 +906,10 @@ ncclResult_t anpNetGetProperties(int dev, ncclNetProperties_t* props) {
   props->port = ibDev->portNum + ibDev->realPort;
   props->maxComms = ibDev->maxQp;
   props->maxRecvs = NCCL_NET_IB_MAX_RECVS;
+#ifndef NCCL_BUILD_ENABLED
   props->netDeviceType    = NCCL_NET_DEVICE_HOST;
   props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
+#endif
   return ncclSuccess;
 }
 
@@ -1309,7 +1331,11 @@ ncclResult_t anpNetListen(int dev, void* opaqueHandle, void** listenComm) {
   return ncclSuccess;
 }
 
-ncclResult_t anpNetConnect(int dev, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** chId) {
+ncclResult_t anpNetConnect(int dev,
+#ifdef NCCL_BUILD_ENABLED
+                           ncclNetCommConfig_t* config,
+#endif
+                           void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** chId) {
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
@@ -1655,7 +1681,11 @@ ib_recv:
 #if defined(HIP_UNCACHED_MEMORY)
         NCCLCHECK(ncclCudaCalloc(&rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int), nullptr, hipDeviceMallocUncached));
 #else
+#ifdef NCCL_BUILD_ENABLED
+        NCCLCHECK(ncclCudaCalloc(&rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int)));
+#else
         NCCLCHECK(ncclCudaCalloc(&rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int), nullptr, hipDeviceMallocFinegrained));
+#endif
 #endif
         NCCLCHECK(wrap_ibv_reg_mr(&rCommDev->gpuFlush.gpuMr, rCommDev->base.pd, rCommDev->gpuFlush.gpuFlushGpuMem, sizeof(int), IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ));
       } else {
@@ -1997,8 +2027,11 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
   return ncclSuccess;
 }
 
-//ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+#ifdef NCCL_BUILD_ENABLED
+ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void* phandle, void** request) {
+#else
 ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mhandle, void** request) {
+#endif
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
@@ -2090,7 +2123,11 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, int size, int tag, void* mh
   return ncclSuccess;
 }
 
+#ifdef NCCL_BUILD_ENABLED
+ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, size_t* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
+#else
 ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int* sizes, int* tags, void** mhandles, struct ncclIbRequest* req) {
+#endif
   struct ibv_send_wr wr;
   memset(&wr, 0, sizeof(wr));
 
@@ -2175,7 +2212,11 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, int
   return ncclSuccess;
 }
 
+#ifdef NCCL_BUILD_ENABLED
+ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** phandles, void** request) {
+#else
 ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, int* sizes, int* tags, void** mhandles, void** request) {
+#endif
   struct ncclIbRecvComm* comm = (struct ncclIbRecvComm*)recvComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIrecv() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }

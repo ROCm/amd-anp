@@ -1,14 +1,15 @@
 PLUGIN_NAME = librccl-net.so
 TARGET = build/$(PLUGIN_NAME)
 CC = /opt/rocm/bin/hipcc
-CFLAGS = -fPIC -g -O2 -O3 -DNDEBUG -Werror -MMD -MP
+CFLAGS = -fPIC -O2 -O3 -DNDEBUG -MMD -MP
 CFLAGS += -DTARGET_PLUGIN
 INCLUDES = -Iinclude \
 		   -I/opt/rocm/include \
-		   -I/usr/include
+		   -I/usr/include \
+		   -include cstring
 
 CPPFLAGS = -D__HIP_PLATFORM_AMD__
-LDFLAGS = -shared -pthread -L/usr/lib64 -L/usr/lib -L$(MPI_LIB_PATH) -libverbs -lmpi -lionic
+LDFLAGS = -shared -pthread -libverbs -lmpi -lionic
 
 SRC_DIRS = src src/misc
 EXCLUDE_FILE =
@@ -19,6 +20,7 @@ SRCS += $(RCCL_HOME)/src/misc/socket.cc \
     $(RCCL_HOME)/src/misc/ibvsymbols.cc \
     $(RCCL_HOME)/src/misc/ibvwrap.cc \
     $(RCCL_BUILD)/hipify/src/misc/utils.cc \
+    $(RCCL_BUILD)/hipify/src/misc/rocmwrap.cc \
     $(RCCL_BUILD)/hipify/src/debug.cc
 OBJS = $(patsubst %.cc, build/%.o, $(SRCS))
 DEPS = $(patsubst %.cc, build/%.d, $(SRCS))
@@ -68,12 +70,17 @@ ifeq ($(ROCM_PATH),)
 else
     ROCM_PATH = $(ROCM_PATH)
 endif
-LDFLAGS  +=  -L$(ROCM_PATH)/lib
+LDFLAGS  +=  -L$(ROCM_PATH)/lib \
+             -L$(RCCL_BUILD)/build/lib \
+             -L/usr/lib64 \
+             -L/usr/lib \
+             -L$(MPI_LIB_PATH)
 
 INCLUDES +=  -I$(RCCL_BUILD)/include \
     -I$(RCCL_BUILD)/hipify/src \
     -I$(RCCL_BUILD)/hipify/src/include \
     -I$(RCCL_BUILD)/hipify/src/include/plugin \
+    -I$(RCCL_BUILD)/build/include \
     -I$(MPI_INCLUDE)
 
 # Ensure build directories exist

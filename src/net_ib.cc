@@ -145,6 +145,94 @@ NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 pthread_t ncclIbAsyncThread;
 struct allocationTracker allocTracker[MAX_ALLOC_TRACK_NGPU] = {};
 
+// optional QP shim glue (runtime only; no build-time dep)
+// env:
+//   IBV_QP_SHIM_LIB -> path to shim .so (default "libibv_dummyshim.so")
+
+extern "C" {
+  typedef struct ibv_qp* (*fp_ibv_qp_shim_create_qp_t)(struct ibv_pd*, struct ibv_qp_init_attr*);
+  typedef int (*fp_ibv_qp_shim_modify_qp_t)(struct ibv_qp*, struct ibv_qp_attr*, int);
+  typedef int (*fp_ibv_qp_shim_destroy_qp_t)(struct ibv_qp*);
+}
+
+// stash original ANP wrappers as function pointers (before remap)
+static ncclResult_t (*anp_orig_wrap_ibv_create_qp)(struct ibv_qp**,
+                                                   struct ibv_pd*,
+                                                   struct ibv_qp_init_attr*) = &wrap_ibv_create_qp;
+static ncclResult_t (*anp_orig_wrap_ibv_modify_qp)(struct ibv_qp*,
+                                                   struct ibv_qp_attr*,
+                                                   int) = &wrap_ibv_modify_qp;
+static ncclResult_t (*anp_orig_wrap_ibv_destroy_qp)(struct ibv_qp*) = &wrap_ibv_destroy_qp;
+
+static void* g_qp_shim_so = nullptr;
+static fp_ibv_qp_shim_create_qp_t  g_shim_create_qp  = nullptr;
+static fp_ibv_qp_shim_modify_qp_t  g_shim_modify_qp  = nullptr;
+static fp_ibv_qp_shim_destroy_qp_t g_shim_destroy_qp = nullptr;
+static pthread_once_t g_qp_shim_once = PTHREAD_ONCE_INIT;
+
+static void anp_try_load_qp_shim(void) {
+  const char* path = getenv("IBV_QP_SHIM_LIB");
+  if (!path || !*path) path = "libibv_dummyshim.so";
+  g_qp_shim_so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (!g_qp_shim_so) return; // No shim present -> wrappers fall back to original ANP wrap_* helpers.
+  g_shim_create_qp  = (fp_ibv_qp_shim_create_qp_t)dlsym(g_qp_shim_so, "ibv_qp_shim_create_qp");
+  g_shim_modify_qp  = (fp_ibv_qp_shim_modify_qp_t)dlsym(g_qp_shim_so, "ibv_qp_shim_modify_qp");
+  g_shim_destroy_qp = (fp_ibv_qp_shim_destroy_qp_t)dlsym(g_qp_shim_so, "ibv_qp_shim_destroy_qp");
+}
+
+static inline ncclResult_t anp_qp_create_wrapped(struct ibv_qp** out,
+                                                 struct ibv_pd* pd,
+                                                 struct ibv_qp_init_attr* attr);
+static inline ncclResult_t anp_qp_modify_wrapped(struct ibv_qp* qp,
+                                                 struct ibv_qp_attr* attr,
+                                                 int attr_mask);
+static inline ncclResult_t anp_qp_destroy_wrapped(struct ibv_qp* qp);
+
+// remap wrap_ibv_* to shim wrappers
+#undef  wrap_ibv_create_qp
+#undef  wrap_ibv_modify_qp
+#undef  wrap_ibv_destroy_qp
+#define wrap_ibv_create_qp(qpp, pd, attr)        anp_qp_create_wrapped((qpp), (pd), (attr))
+#define wrap_ibv_modify_qp(qp, attr, mask)       anp_qp_modify_wrapped((qp), (attr), (mask))
+#define wrap_ibv_destroy_qp(qp)                  anp_qp_destroy_wrapped((qp))
+
+static inline ncclResult_t anp_qp_create_wrapped(struct ibv_qp** out,
+                                                 struct ibv_pd* pd,
+                                                 struct ibv_qp_init_attr* attr) {
+  pthread_once(&g_qp_shim_once, anp_try_load_qp_shim);
+  if (g_shim_create_qp) {
+    struct ibv_qp* q = g_shim_create_qp(pd, attr);
+    if (!q) return ncclSystemError;
+    *out = q;
+    return ncclSuccess;
+  }
+  // Fallback: original ANP wrapper
+  return anp_orig_wrap_ibv_create_qp(out, pd, attr);
+}
+
+static inline ncclResult_t anp_qp_modify_wrapped(struct ibv_qp* qp,
+                                                 struct ibv_qp_attr* attr,
+                                                 int attr_mask) {
+  pthread_once(&g_qp_shim_once, anp_try_load_qp_shim);
+  if (g_shim_modify_qp) {
+    int rc = g_shim_modify_qp(qp, attr, attr_mask);
+    return (rc == 0) ? ncclSuccess : ncclSystemError;
+  }
+  // fallback: original ANP wrapper
+  return anp_orig_wrap_ibv_modify_qp(qp, attr, attr_mask);
+}
+
+static inline ncclResult_t anp_qp_destroy_wrapped(struct ibv_qp* qp) {
+  pthread_once(&g_qp_shim_once, anp_try_load_qp_shim);
+  if (g_shim_destroy_qp) {
+    int rc = g_shim_destroy_qp(qp);
+    return (rc == 0) ? ncclSuccess : ncclSystemError;
+  }
+  // fallback: original ANP wrapper
+  return anp_orig_wrap_ibv_destroy_qp(qp);
+}
+// end of optional shim glue
+
 static void
 anp_stats_dump_on_signal (void)
 {

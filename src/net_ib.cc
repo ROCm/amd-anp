@@ -49,6 +49,7 @@ extern void *anp_rccl_bootstrap_handler(void *arg);
 
 //#define ANP_DEBUG_TRACE_EN
 #define CTS_INLINE_ENABLED
+#define CTS_RCVR_OFFLOAD_ENABLED
 
 #define MAX_INLINE_DATA_SIZE 24
 #define ENABLE_TIMER 0
@@ -127,7 +128,7 @@ struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
 pthread_mutex_t ncclIbLock = PTHREAD_MUTEX_INITIALIZER;
 static int ncclIbRelaxedOrderingEnabled = 0;
 
-NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", 0);
+NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -2);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
 NCCL_PARAM(IbRoceVersionNum, "IB_ROCE_VERSION_NUM", 2);
 NCCL_PARAM(IbTimeout, "IB_TIMEOUT", 18);
@@ -140,6 +141,7 @@ NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
 NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
+RCCL_PARAM(IbAbortOnError, "IB_ABORT_ON_ERROR", 0);
 
 pthread_t ncclIbAsyncThread;
 struct allocationTracker allocTracker[MAX_ALLOC_TRACK_NGPU] = {};
@@ -727,7 +729,7 @@ static void showVersion() {
 }
 
 // Plugin implementations of the required functions
-ncclResult_t anpNetInit(ncclDebugLogger_t logFunction) {
+ncclResult_t anpNetInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret;
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
@@ -1426,15 +1428,14 @@ ncclResult_t anpNetListen(int dev, void* opaqueHandle, void** listenComm) {
   return ncclSuccess;
 }
 
-ncclResult_t anpNetConnect(int dev, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** chId) {
+ncclResult_t anpNetConnect(int dev, ncclNetCommConfig_t* config, void* opaqueHandle, void** sendComm, ncclNetDeviceHandle_t** ncclNetCtxt) {
   struct ncclIbHandle* handle = (struct ncclIbHandle*) opaqueHandle;
   struct ncclIbCommStage* stage = &handle->stage;
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)stage->comm;
   int ready;
   *sendComm = NULL;
 
-  int myChId = (int)(uintptr_t)chId;
-  int channelId = myChId;
+  int channelId = ((ncclNet_ctxt_t *)ncclNetCtxt)->chId;
   if (stage->state == ncclIbCommStateConnect)    goto ib_connect_check;
   if (stage->state == ncclIbCommStateSend)       goto ib_send;
   if (stage->state == ncclIbCommStateConnecting) goto ib_connect;
@@ -1650,15 +1651,14 @@ NCCL_PARAM(IbGdrFlushDisable, "GDR_FLUSH_DISABLE", 0);
 NCCL_PARAM(IbGdrFlushGpuMemNoRelaxedOrdering, "GDR_FLUSH_GPU_MEM_NO_RELAXED_ORDERING", 1);
 
 //ncclResult_t anpNetAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** /*recvDevComm*/) {
-ncclResult_t anpNetAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** chId) {
+ncclResult_t anpNetAccept(void* listenComm, void** recvComm, ncclNetDeviceHandle_t** ncclNetCtxt) {
   struct ncclIbListenComm* lComm = (struct ncclIbListenComm*)listenComm;
   struct ncclIbCommStage* stage = &lComm->stage;
   struct ncclIbRecvComm* rComm = (struct ncclIbRecvComm*)stage->comm;
   int ready;
   *recvComm = NULL;
 
-  int myChId = (int)(uintptr_t)chId;
-  int channelId = myChId;
+  int channelId = ((ncclNet_ctxt_t *)ncclNetCtxt)->chId;
   if (stage->state == ncclIbCommStateAccept) goto ib_accept_check;
   if (stage->state == ncclIbCommStateRecv) goto ib_recv;
   if (stage->state == ncclIbCommStateSend) goto ib_send;
@@ -2163,7 +2163,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
   return ncclSuccess;
 }
 
-ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void** request) {
+ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void* mhandle, void *phandle, void** request) {
   struct ncclIbSendComm* comm = (struct ncclIbSendComm*)sendComm;
   if (comm->base.ready == 0) { WARN("NET/IB: ncclIbIsend() called when comm->base.ready == 0"); return ncclInternalError; }
   if (comm->base.ready == 0) { *request = NULL; return ncclSuccess; }
@@ -2478,7 +2478,7 @@ static ncclResult_t anpNetIrecvPostCTS(void* recvComm, int n, void** data, size_
   return ncclSuccess;
 }
 
-ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void** request) {
+ncclResult_t anpNetIrecv(void* recvComm, int n, void** data, size_t* sizes, int* tags, void** mhandles, void **phandles, void** request) {
 #ifdef ANP_DEBUG_TRACE_EN
     INFO(NCCL_NET, "Processing recv, recvComm %p, n %d", recvComm, n);
 #endif
@@ -2545,6 +2545,23 @@ ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** 
   return ncclSuccess;
 }
 
+static inline ncclResult_t anp_ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc, int* num_done) {
+  int done = cq->context->ops.poll_cq(cq, num_entries, wc); /*returns the number of wcs or 0 on success, a negative number otherwise*/
+  for (int i=0; i<done; i++) {
+    if (wc[i].status != IBV_WC_SUCCESS) {
+      assert(0);
+      return ncclSystemError;
+    }
+  }
+  if (done < 0) {
+    WARN("Call to ibv_poll_cq() returned %d", done);
+    assert(0);
+    return ncclSystemError;
+  }
+  *num_done = done;
+  return ncclSuccess;
+}
+
 #define ANP_CQ_POLL_MAX_EVENT        16
 ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
@@ -2571,8 +2588,11 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
       TIME_START(3);
       // If we expect any completions from this device's CQ
       if (r->events[i]) {
-        NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
-                                   wcs, &wrDone));
+        if (rcclParamIbAbortOnError()) {
+            NCCLCHECK(anp_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT, wcs, &wrDone));
+        } else {
+            NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT, wcs, &wrDone));
+        }
         totalWrDone += wrDone;
         ANP_TELEMETRY_EXECUTE(
             g_anp_state.update_cq_poll_metrics();

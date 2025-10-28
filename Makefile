@@ -1,4 +1,4 @@
-PLUGIN_NAME = librccl-net.so
+PLUGIN_NAME = librccl-anp.so
 TARGET = build/$(PLUGIN_NAME)
 CC = /opt/rocm/bin/hipcc
 CFLAGS = -fPIC -O2 -O3 -DNDEBUG -MMD -MP
@@ -9,7 +9,7 @@ INCLUDES = -Iinclude \
 		   -include cstring
 
 CPPFLAGS = -D__HIP_PLATFORM_AMD__
-LDFLAGS = -shared -pthread -libverbs -lmpi -lionic
+LDFLAGS = -shared -pthread -lionic
 
 SRC_DIRS = src src/misc
 EXCLUDE_FILE =
@@ -67,21 +67,17 @@ endif
 # Check if ROCM_PATH is provided
 ifeq ($(ROCM_PATH),)
     ROCM_PATH = /opt/rocm
-else
-    ROCM_PATH = $(ROCM_PATH)
 endif
 LDFLAGS  +=  -L$(ROCM_PATH)/lib \
              -L$(RCCL_BUILD)/build/lib \
              -L/usr/lib64 \
-             -L/usr/lib \
-             -L$(MPI_LIB_PATH)
+             -L/usr/lib
 
 INCLUDES +=  -I$(RCCL_BUILD)/include \
     -I$(RCCL_BUILD)/hipify/src \
     -I$(RCCL_BUILD)/hipify/src/include \
     -I$(RCCL_BUILD)/hipify/src/include/plugin \
-    -I$(RCCL_BUILD)/build/include \
-    -I$(MPI_INCLUDE)
+    -I$(RCCL_BUILD)/build/include
 
 # Ensure build directories exist
 $(shell mkdir -p build $(addprefix build/, $(SRC_DIRS)))
@@ -115,18 +111,5 @@ help:
 	@echo "	   ANP_TELEMETRY_ENABLED must be set to 1 to build plugin with debug/telemetry."
 	@echo "	   Example: make RCCL_BUILD=/home/user/rccl/build ROCM_PATH=/opt/rocm"
 	@echo "	   If ROCM_PATH is not provided, the default path /opt/rocm/lib is used."
-	@echo "	   If libmpi.so is not found, provide MPI_LIB_PATH=/path/to/libmpi.so"
-	@echo "	   If mpi.h is not found, provide MPI_INCLUDE=/path/to/ompi/include"
-
-# Build target for the "bootstrap" binary from src/bootstrap.cc
-bootstrap: build/bootstrap.o
-
-build/bootstrap.o:
-	g++ -fPIC $(CPPFLAGS) $(INCLUDES) -o bootstrap src/bootstrap.cc src/bootstrap_socket.cc
-	@echo "------------------------------------------------------------"
-	@echo "Binary 'bootstrap' built successfully!"
-	@echo "Usage: ./bootstrap <ip_list_file>"
-	@echo "  <ip_list_file> should be a text file with one IP per line."
-	@echo "------------------------------------------------------------"
 
 .PHONY: all clean

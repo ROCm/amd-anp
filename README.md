@@ -66,46 +66,38 @@ cd amd-anp
      ```bash
      export RCCL_BUILD=/home/user/rccl/build
      ```
-5. **Specify `MPI` Paths:**
 
-   -  Please provide the include and library paths for your MPI installation.
-      ```bash
-      export MPI_INCLUDE=/path/to/mpi/include
-      export MPI_LIB_PATH=/path/to/mpi/lib
-      ```
-      Please make sure to replace the paths with your MPI installation's paths.
-
-6. **Optional: `ROCM_PATH`**:
+5. **Optional: `ROCM_PATH`**:
    - If ROCm is in a custom directory (not `/opt/rocm`), specify:
      ```bash
      make RCCL_HOME=$RCCL_HOME ROCM_PATH=/path/to/rocm
      ```
 
-7. **Build Without Telemetry (Default):**
+6. **Build Without Telemetry (Default):**
 
     To build the plugin without the telemetry features enabled (the default behavior), simply run the `make` command:
 
     ```bash
-    make RCCL_HOME=$RCCL_HOME MPI_INCLUDE=$MPI_INCLUDE MPI_LIB_PATH=$MPI_LIB_PATH
+    make RCCL_HOME=$RCCL_HOME
     ```
-    If successful, you will see `librccl-net.so` in the `build/` folder of this plugin project.
+    If successful, you will see `librccl-anp.so` in the `build/` folder of this plugin project.
 
     **Example:**
     ```bash
-    make RCCL_HOME=/home/user/rccl-src/ MPI_INCLUDE=/home/user/ompi-4.1.6/install/include/ MPI_LIB_PATH=/home/user/ompi-4.1.6/build/ompi/.libs/
+    make RCCL_HOME=/home/user/rccl-src/
     ```
 8.  **Build With Telemetry Enabled:**
 
     To build the plugin with telemetry features enabled use the build command with flag ANP_TELEMETRY_ENABLED=1.
 
     ```bash
-    make ANP_TELEMETRY_ENABLED=1 RCCL_HOME=$RCCL_HOME MPI_INCLUDE=$MPI_INCLUDE MPI_LIB_PATH=$MPI_LIB_PATH
+    make ANP_TELEMETRY_ENABLED=1 RCCL_HOME=$RCCL_HOME
     ```
-    If successful, you will see `librccl-net.so` in the `build/` folder of this plugin project.
+    If successful, you will see `librccl-anp.so` in the `build/` folder of this plugin project.
 
     **Example:**
     ```bash
-    make ANP_TELEMETRY_ENABLED=1 RCCL_HOME=/home/user/rccl-src/ MPI_INCLUDE=/home/user/ompi-4.1.6/install/include/ MPI_LIB_PATH=/home/user/ompi-4.1.6/build/ompi/.libs/
+    make ANP_TELEMETRY_ENABLED=1 RCCL_HOME=/home/user/rccl-src/
 
 ---
 
@@ -114,8 +106,11 @@ To install the plugin into your ROCm library path, run:
 ```bash
 sudo make RCCL_HOME=$RCCL_HOME ROCM_PATH=/path/to/rocm install
 ```
-This copies `librccl-net.so` to `<ROCM_PATH>/lib`.
+This copies `librccl-anp.so` to `<ROCM_PATH>/lib`.
 `<ROCM_PATH>` defaults to `/opt/rocm` unless overridden by `ROCM_PATH`.
+
+To load this specific AINIC plugin library when running RCCL, set the env `-x NCCL_NET_PLUGIN=librccl-anp.so`.
+Setting this env, RCCL will load this specific AINIC plugin library instead of the default plugin library `librccl-net.so`.
 
 ---
 
@@ -132,7 +127,7 @@ make clean
 
 ### `uninstall` Target
 
-The uninstall target is used to remove the compiled plugin library `librccl-net.so` from the installation path `<ROCM_PATH>/lib`
+The uninstall target is used to remove the compiled plugin library `librccl-anp.so` from the installation path `<ROCM_PATH>/lib`
 
 **Usage:**
 ```bash

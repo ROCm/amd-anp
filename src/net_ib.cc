@@ -845,11 +845,9 @@ ncclResult_t anpNetInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
     pthread_mutex_lock(&ncclIbLock);
     wrap_ibv_fork_init();
     if (ncclNIbDevs == -1) {
-      int nIpIfs = 0;
       ncclNIbDevs = 0;
       ncclNMergedIbDevs = 0;
-      NCCLCHECK(ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1, &nIpIfs));
-      if (nIpIfs != 1) {
+      if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
         WARN("NET/IB : No IP interface found.");
         ret = ncclInternalError;
         goto fail;

@@ -19,6 +19,7 @@ SRCS += $(RCCL_HOME)/src/misc/socket.cc \
     $(RCCL_HOME)/src/misc/param.cc \
     $(RCCL_HOME)/src/misc/ibvsymbols.cc \
     $(RCCL_HOME)/src/misc/ibvwrap.cc \
+    $(RCCL_HOME)/src/misc/archinfo.cc \
     $(RCCL_BUILD)/hipify/src/misc/utils.cc \
     $(RCCL_BUILD)/hipify/src/misc/rocmwrap.cc \
     $(RCCL_BUILD)/hipify/src/debug.cc

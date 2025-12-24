@@ -3,6 +3,15 @@ TARGET = build/$(PLUGIN_NAME)
 CC = /opt/rocm/bin/hipcc
 CFLAGS = -fPIC -O2 -O3 -DNDEBUG -MMD -MP
 CFLAGS += -DTARGET_PLUGIN
+
+# Set the IB verbs header/ABI version to match the installed libibverbs.
+# The value 390 corresponds to the VERBS/IB verbs version used when this
+# Makefile was authored (e.g., as defined in the system's infiniband/verbs.h).
+# If your system uses a different libibverbs version, adjust this number to
+# match the version macro from your installed headers (typically found in
+# /usr/include/infiniband/verbs.h) before building.
+CFLAGS += -DLIBIBVERBS_VER=390
+
 INCLUDES = -Iinclude \
 		   -I/opt/rocm/include \
 		   -I/usr/include \

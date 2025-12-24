@@ -164,7 +164,7 @@ static int ncclIbRelaxedOrderingEnabled = 0;
 #define NCCL_IB_SL_DEFAULT 0
 #define NCCL_IB_TC_DEFAULT 0
 
-NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", 0);
+NCCL_PARAM(IbGidIndex, "IB_GID_INDEX", -2);
 NCCL_PARAM(IbRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
 NCCL_PARAM(IbRoceVersionNum, "IB_ROCE_VERSION_NUM", 2);
 NCCL_PARAM(IbTimeout, "IB_TIMEOUT", 20);
@@ -845,11 +845,9 @@ ncclResult_t anpNetInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
     pthread_mutex_lock(&ncclIbLock);
     wrap_ibv_fork_init();
     if (ncclNIbDevs == -1) {
-      int nIpIfs = 0;
       ncclNIbDevs = 0;
       ncclNMergedIbDevs = 0;
-      NCCLCHECK(ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1, &nIpIfs));
-      if (nIpIfs != 1) {
+      if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
         WARN("NET/IB : No IP interface found.");
         ret = ncclInternalError;
         goto fail;
@@ -912,10 +910,12 @@ ncclResult_t anpNetInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
             ncclIbDevs[ncclNIbDevs].portAttr = portAttr;
             ncclIbDevs[ncclNIbDevs].portNum = port_num;
             ncclIbDevs[ncclNIbDevs].link = portAttr.link_layer;
+#if LIBIBVERBS_VER >= 490
             if (portAttr.active_speed_ex)
               // A non-zero active_speed_ex indicates XDR rate (0x100) or higher
               ncclIbDevs[ncclNIbDevs].speed = ncclIbSpeed(portAttr.active_speed_ex) * ncclIbWidth(portAttr.active_width);
             else
+#endif
               ncclIbDevs[ncclNIbDevs].speed = ncclIbSpeed(portAttr.active_speed) * ncclIbWidth(portAttr.active_width);
             ncclIbDevs[ncclNIbDevs].context = context;
             ncclIbDevs[ncclNIbDevs].pdRefs = 0;

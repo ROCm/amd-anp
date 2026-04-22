@@ -21,7 +21,7 @@
 PLUGIN_NAME = librccl-anp.so
 TARGET = build/$(PLUGIN_NAME)
 CC = /opt/rocm/bin/hipcc
-CFLAGS = -fPIC -O2 -O3 -DNDEBUG -MMD -MP
+CFLAGS = -fPIC -O2 -O3 -MMD -MP
 CFLAGS += -DTARGET_PLUGIN
 
 # Set the IB verbs header/ABI version to match the installed libibverbs.

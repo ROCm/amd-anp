@@ -182,6 +182,10 @@ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
+NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
+RCCL_PARAM(IbQpsPerP2p, "IB_QPS_PER_P2P", 0);
+RCCL_PARAM(IbAbortOnError, "IB_ABORT_ON_ERROR", 0);
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
   __atomic_store_n(&stat->fatalErrorCount, 0, __ATOMIC_RELAXED);
@@ -1344,8 +1348,6 @@ struct ncclIbRecvComm {
   int flushEnabled;
 };
 static_assert((offsetof(struct ncclIbRecvComm, remFifo) % 32) == 0, "ncclIbRecvComm fifo must be 32-byte aligned");
-
-NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
 
 static void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex, struct ncclIbNetCommDevBase* base) {
   req->events[devIndex]++;
@@ -2922,6 +2924,26 @@ ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** 
   return ncclSuccess;
 }
 
+static inline ncclResult_t anp_ibv_poll_cq(struct ibv_cq *cq, int num_entries,
+		                                   struct ibv_wc *wc, int* num_done) {
+  /* returns the number of wcs or 0 on success, a negative number otherwise */
+  int done = cq->context->ops.poll_cq(cq, num_entries, wc);
+
+  for (int i=0; i<done; i++) {
+    if (wc[i].status != IBV_WC_SUCCESS) {
+      assert(0);
+      return ncclSystemError;
+    }
+  }
+  if (done < 0) {
+    WARN("Call to ibv_poll_cq() returned %d", done);
+    assert(0);
+    return ncclSystemError;
+  }
+  *num_done = done;
+  return ncclSuccess;
+}
+
 #define ANP_CQ_POLL_MAX_EVENT        16
 #define HCA_NAME(req, index) ((req)->devBases[(index)]->pd->context->device->name)
 
@@ -2974,8 +2996,13 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
       TIME_START(3);
       // If we expect any completions from this device's CQ
       if (r->events[i]) {
-        NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
-                                   wcs, &wrDone));
+        if (rcclParamIbAbortOnError()) {
+            NCCLCHECK(anp_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                      wcs, &wrDone));
+        } else {
+            NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                       wcs, &wrDone));
+        }
         totalWrDone += wrDone;
         ANP_TELEMETRY_EXECUTE(
             g_anp_state.update_cq_poll_metrics();

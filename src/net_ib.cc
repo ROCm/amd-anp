@@ -2861,9 +2861,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
 
   if ((nreqs == 1) && (use_write_op == false)) {
     immData = reqs[0]->send.size;
-  } else if (use_write_op == false) {
-    // nreqs > 1 OR comm group: write sizes to remSizesFifo
-    // TODO: fix this comment !!
+  } else {
     int* sizes = comm->remSizesFifo.elems[slot];
     for (int r=0; r<nreqs; r++) sizes[r] = reqs[r]->send.size;
     comm->remSizesFifo.sge.addr = (uint64_t)sizes;
@@ -3690,6 +3688,7 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
+    struct ncclIbNetCommDevBase* savedPrimaryDevBase = NULL;
     if (comm->base.inCommGroup) {
       for (int q = 0; q < comm->base.nqps; q++) {
         if (comm->base.qps[q].qp == NULL) continue;
@@ -3705,7 +3704,7 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
                  comm->base.commGroupIdx, group->groupHash);
             NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
             group->qp = NULL;
-            NCCLCHECK(ncclIbDestroyBase(group->primaryDevBase));
+            savedPrimaryDevBase = group->primaryDevBase;
             anpRemoveCommGroup(group);
           }
         } else {
@@ -3732,6 +3731,9 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
         NCCLCHECK(ncclIbDestroyBase(&commDev->base));
       }
     }
+    if (savedPrimaryDevBase) {
+      NCCLCHECK(ncclIbDestroyBase(savedPrimaryDevBase));
+    }
     anpCommDbEntryRemove(comm->base.commId);
     free(comm);
   }
@@ -3752,6 +3754,7 @@ ncclResult_t anpNetCloseRecv(void* recvComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
+    struct ncclIbNetCommDevBase* savedPrimaryDevBase = NULL;
     if (comm->base.inCommGroup) {
       for (int q = 0; q < comm->base.nqps; q++) {
         if (comm->base.qps[q].qp == NULL) continue;
@@ -3767,7 +3770,7 @@ ncclResult_t anpNetCloseRecv(void* recvComm) {
                  comm->base.commGroupIdx, group->groupHash);
             NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
             group->qp = NULL;
-            NCCLCHECK(ncclIbDestroyBase(group->primaryDevBase));
+            savedPrimaryDevBase = group->primaryDevBase;
             anpRemoveCommGroup(group);
           }
         } else {
@@ -3808,6 +3811,9 @@ ncclResult_t anpNetCloseRecv(void* recvComm) {
       if (!comm->base.isPrimaryComm) {
         NCCLCHECK(ncclIbDestroyBase(&commDev->base));
       }
+    }
+    if (savedPrimaryDevBase) {
+      NCCLCHECK(ncclIbDestroyBase(savedPrimaryDevBase));
     }
     anpCommDbEntryRemove(comm->base.commId);
     free(comm);

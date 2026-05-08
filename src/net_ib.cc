@@ -54,7 +54,7 @@ extern int64_t ncclParamDmaBufEnable();
 
 //#define ANP_DEBUG_TRACE_EN
 #define CTS_INLINE_ENABLED
-#define CTS_RCVR_OFFLOAD_ENABLED
+// #define CTS_RCVR_OFFLOAD_ENABLED
 
 #define MAX_INLINE_DATA_SIZE 24
 
@@ -184,7 +184,7 @@ NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
 RCCL_PARAM(IbAbortOnError, "IB_ABORT_ON_ERROR", 0);
 RCCL_PARAM(AnpCommNGroups, "ANP_COMM_NGROUPS", 0);
-RCCL_PARAM(AnpQpDepthMultiplier, "ANP_QP_DEPTH_MULTIPLIER", 4);
+RCCL_PARAM(AnpQpDepthMultiplier, "ANP_QP_DEPTH_MULTIPLIER", 1);
 
 static ncclResult_t ncclIbStatsInit(struct ncclIbStats* stat) {
   __atomic_store_n(&stat->fatalErrorCount, 0, __ATOMIC_RELAXED);

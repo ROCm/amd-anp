@@ -182,6 +182,7 @@ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+RCCL_PARAM(IbAbortOnError, "IB_ABORT_ON_ERROR", 0);
 RCCL_PARAM(AnpCommNGroups, "ANP_COMM_NGROUPS", 0);
 RCCL_PARAM(AnpQpDepthMultiplier, "ANP_QP_DEPTH_MULTIPLIER", 4);
 
@@ -1712,7 +1713,7 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   qpAttr.port_num = ib_port;
   qpAttr.qp_access_flags = access_flags;
   NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
-  TRACE(NCCL_NET, "NET/IB : ncclIbCreateQp port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qpn=%u pkey=%u pd=%p",
+  INFO(NCCL_NET, "NET/IB : ncclIbCreateQp port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qpn=%u pkey=%u pd=%p",
     ib_port, base->ibDevN, ncclIbDevs[base->ibDevN].devName, ncclNIbDevs, ncclNMergedIbDevs, qp->qp->qp_num, qpAttr.pkey_index, base->pd);
   ANP_TELEMETRY_EXECUTE(
       anp_create_json_thread();
@@ -1773,7 +1774,7 @@ ncclResult_t ncclIbRtrQp(struct ibv_qp* qp, struct ncclIbGidInfo* sGidInfo, uint
   qpAttr.ah_attr.sl = sl;
   qpAttr.ah_attr.src_path_bits = 0;
   qpAttr.ah_attr.port_num = info->ib_port;
-  TRACE(NCCL_NET, "NET/IB : ncclIbRtrQp qpn=%u mtu=%d dst=%u ll=%u port=%u sl: %d tc: %d", qp->qp_num, info->mtu, dest_qp_num, info->link_layer, info->ib_port, qpAttr.ah_attr.sl, qpAttr.ah_attr.grh.traffic_class);
+  INFO(NCCL_NET, "NET/IB : ncclIbRtrQp qpn=%u mtu=%d dst=%u ll=%u port=%u sl: %d tc: %d", qp->qp_num, info->mtu, dest_qp_num, info->link_layer, info->ib_port, qpAttr.ah_attr.sl, qpAttr.ah_attr.grh.traffic_class);
   NCCLCHECK(wrap_ibv_modify_qp(qp, &qpAttr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER));
   return ncclSuccess;
 }
@@ -2097,12 +2098,12 @@ ib_recv_dev_list:
       // Print just the QPs for this dev
       if (comm->base.qps[q].devIndex == i) {
         if (devInfo->link_layer == IBV_LINK_LAYER_INFINIBAND) { // IB
-          INFO(NCCL_NET,"NET/IB: %s %d IbDev %d Port %d qpn %d mtu %d LID %d subnet-prefix %lu  FLID %d fifoRkey=0x%x fifoLkey=0x%x",
+          INFO(NCCL_NET,"NET/IB: %s %d IbDev %d Port %d qpn %d mtu %d LID %d subnet-prefix %llu  FLID %d fifoRkey=0x%x fifoLkey=0x%x",
                comm->base.vProps.ndevs > 2 ? "NCCL MergedDev" : "NCCL Dev",
                dev, commDev->base.ibDevN, ibDev->portNum, meta.qpInfo[q].qpn, devInfo->mtu, devInfo->lid,
                devInfo->gid.global.subnet_prefix, ncclIbExtractFlid(&devInfo->gid), devInfo->fifoRkey, commDev->fifoMr->lkey);
         } else { // RoCE
-          INFO(NCCL_NET,"NET/IB: %s %d IbDev %d Port %d qpn %d mtu %d GID %ld (%lX/%lX) fifoRkey=0x%x fifoLkey=0x%x",
+          INFO(NCCL_NET,"NET/IB: %s %d IbDev %d Port %d qpn %d mtu %d GID %ld (%llx/%llx) fifoRkey=0x%x fifoLkey=0x%x",
                comm->base.vProps.ndevs > 2 ? "NCCL MergedDev" : "NCCL Dev", dev,
                commDev->base.ibDevN, ibDev->portNum, meta.qpInfo[q].qpn, devInfo->mtu,
                (int64_t)commDev->base.gidInfo.localGidIndex,
@@ -2803,7 +2804,7 @@ ncclResult_t ncclIbRegMrDmaBufInternal(ncclIbNetCommDevBase* base, void* data, s
           NCCLCHECKGOTO(wrap_ibv_reg_mr(&mr, base->pd, (void*)addr, pages*pageSize, flags), res, returning);
         }
       }
-      TRACE(NCCL_INIT|NCCL_NET,"regAddr=0x%lx size=%lld rkey=0x%x lkey=0x%x fd=%d", (unsigned long)addr, (long long)pages*pageSize, mr->rkey, mr->lkey, fd);
+      INFO(NCCL_INIT|NCCL_NET,"regAddr=0x%lx size=%lld rkey=0x%x lkey=0x%x fd=%d", (unsigned long)addr, (long long)pages*pageSize, mr->rkey, mr->lkey, fd);
       if (slot != cache->population) memmove(cache->slots+slot+1, cache->slots+slot, (cache->population-slot)*sizeof(struct ncclIbMr));
       cache->slots[slot].addr = addr;
       cache->slots[slot].pages = pages;
@@ -3533,6 +3534,25 @@ static int getReqQpIndex(struct ncclIbRequest* req, int request, int qpNumber) {
 }
 #endif
 
+static inline ncclResult_t anp_ibv_poll_cq(struct ibv_cq *cq, int num_entries,
+                                           struct ibv_wc *wc, int* num_done) {
+  int done = cq->context->ops.poll_cq(cq, num_entries, wc);
+
+  for (int i=0; i<done; i++) {
+    if (wc[i].status != IBV_WC_SUCCESS) {
+      assert(0);
+      return ncclSystemError;
+    }
+  }
+
+  if (done < 0) {
+    WARN("NET/IB: anp_ibv_poll_cq failed with %d", done);
+    return ncclSystemError;
+  }
+  *num_done = done;
+  return ncclSuccess;
+}
+
 ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
@@ -3572,8 +3592,15 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
       TIME_START(3);
       // If we expect any completions from this device's CQ
       if (r->events[i]) {
-        NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
-                                   wcs, &wrDone));
+	
+	if (rcclParamIbAbortOnError()) {
+		NCCLCHECK(anp_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+					wcs, &wrDone));
+	} else {
+		NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+					wcs, &wrDone));
+	}
+
         totalWrDone += wrDone;
         ANP_TELEMETRY_EXECUTE(
             g_anp_state.update_cq_poll_metrics();

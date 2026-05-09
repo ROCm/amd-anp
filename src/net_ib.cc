@@ -1644,14 +1644,17 @@ static bool last_ud[128];
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
                             int access_flags, void* qp_context, struct ncclIbQp* qp,
                             int channelId, bool dataQP, int8_t qp_idx, int nqps,
-                            int depthMultiplier = 1) {
+                            int depthMultiplier = 1, int groupIdx = -1) {
   struct ibv_qp_init_attr qpInitAttr;
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
   qpInitAttr.qp_context = qp_context;
   qpInitAttr.send_cq = base->cq;
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
-  if (dataQP) {
+  if (groupIdx >= 0) {
+    uint8_t mask = (groupIdx % 2 == 0) ? IONIC_UDMA_MASK_LOW : IONIC_UDMA_MASK_HIGH;
+    wrap_ibv_pd_set_udma_mask(base->pd, mask);
+  } else if (dataQP) {
     if (!data_channel_ud[channelId].ud_allocated) {
       bool lud = data_last_ud[base->ibDevN];
       data_channel_ud[channelId].ud_id = lud;
@@ -2011,7 +2014,7 @@ ib_recv_dev_list:
     for (int q = 0; q < comm->base.nqps; q++) {
       ncclIbSendCommDev* commDev = comm->devs + devIndex;
       ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q, channelId, true, q, comm->base.nqps, depthMult), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q, channelId, true, q, comm->base.nqps, depthMult, groupIdx), ret, fail);
       comm->base.qps[q].devIndex = devIndex;
       meta.qpInfo[q].qpn      = comm->base.qps[q].qp->qp_num;
       meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
@@ -2535,7 +2538,7 @@ ib_recv:
 
       ibDevN = rComm->devs[devIndex].base.ibDevN;
       ibDev = ncclIbDevs + ibDevN;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, qp, channelId, false, q, rComm->base.nqps, depthMult), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, qp, channelId, false, q, rComm->base.nqps, depthMult, remMeta.sharedGroupIdx), ret, fail);
       qp->devIndex = devIndex;
       devIndex = (devIndex + 1) % rComm->base.vProps.ndevs;
 

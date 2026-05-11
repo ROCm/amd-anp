@@ -1404,12 +1404,15 @@ static int anpCountPeerTotalRefcount(int ibDevN, const union ncclSocketAddress* 
 // Allocate a commId and register in the global comm table
 static uint16_t anpAllocCommId(void* comm, bool isSend) {
     pthread_mutex_lock(&g_sharedQpLock);
-    uint16_t id = g_nextCommId++;
-    if (id < ANP_MAX_COMMS) {
-        g_commTable[id].comm = comm;
-        g_commTable[id].isSend = isSend;
-        g_commTable[id].used = true;
+    if (g_nextCommId >= ANP_MAX_COMMS) {
+        pthread_mutex_unlock(&g_sharedQpLock);
+        WARN("NET/IB: commId pool exhausted (max %d), falling back to non-sharing", ANP_MAX_COMMS);
+        return 0;
     }
+    uint16_t id = g_nextCommId++;
+    g_commTable[id].comm = comm;
+    g_commTable[id].isSend = isSend;
+    g_commTable[id].used = true;
     pthread_mutex_unlock(&g_sharedQpLock);
     return id;
 }
@@ -1917,7 +1920,8 @@ ib_recv_dev_list:
 
   if (rcclParamAnpCommNGroups() > 0) {
     comm->base.commId = anpAllocCommId(comm, true);
-
+  }
+  if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
     // Build probe key to count existing comms to this peer
     anpSharedQpKey probeKey;
     memset(&probeKey, 0, sizeof(probeKey));
@@ -2445,6 +2449,8 @@ ib_recv:
 
   if (rcclParamAnpCommNGroups() > 0) {
     rComm->base.commId = anpAllocCommId(rComm, false);
+  }
+  if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
     rComm->base.sharedGroupIdx = remMeta.sharedGroupIdx;
     rComm->base.remIbDevIdx = remMeta.senderIbDevIdx;
 
@@ -2517,7 +2523,7 @@ ib_recv:
     INFO(NCCL_NET, "ANP QP Sharing: SECONDARY accept ch=%d group=%d commId=%d nqps=%d qpn[0]=%d remQpn[0]=%d",
          channelId, remMeta.sharedGroupIdx, rComm->base.commId, rComm->base.nqps,
          meta.qpInfo[0].qpn, remMeta.qpInfo[0].qpn);
-  } else if (rcclParamAnpCommNGroups() > 0) {
+  } else if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
     // PRIMARY: create QPs with scaled depth
     rComm->base.isSharedQpPrimary = true;
     int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
@@ -2709,7 +2715,7 @@ ib_recv:
   meta.sl = remMeta.sl;
   meta.tc = remMeta.tc;
 
-  if (!acceptIsSharedSecondary && rcclParamAnpCommNGroups() == 0) {
+  if (!acceptIsSharedSecondary && (rcclParamAnpCommNGroups() == 0 || rComm->base.commId == 0)) {
     // Non-sharing: fill qpInfo from created QPs (sharing branches set these already)
     for (int q = 0; q < rComm->base.nqps; q++) {
       meta.qpInfo[q].qpn      = rComm->base.qps[q].qp->qp_num;
@@ -2949,7 +2955,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
   // For shared QPs, imm_data carries receiver's commId + req_idx for completion routing.
   uint32_t immData = 0;
   if ((nreqs == 1) && (use_write_op == false)) {
-    if (rcclParamAnpCommNGroups() > 0) {
+    if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0 && comm->remCommId != 0) {
       volatile struct ncclIbSendFifo* fifoSlots = comm->fifo[slot];
       uint8_t recvReqIdx = fifoSlots[0].req_idx;
       immData = ((uint32_t)recvReqIdx << 16) | (uint32_t)comm->remCommId;
@@ -3755,7 +3761,7 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
-    if (rcclParamAnpCommNGroups() > 0) {
+    if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
       // === Shared QP: refcount-based teardown ===
       INFO(NCCL_NET, "ANP TEARDOWN: anpNetCloseSend commId=%d nqps=%d ndevs=%d group=%d",
            comm->base.commId, comm->base.nqps, comm->base.vProps.ndevs, comm->base.sharedGroupIdx);
@@ -3847,7 +3853,7 @@ ncclResult_t anpNetCloseRecv(void* recvComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
-    if (rcclParamAnpCommNGroups() > 0) {
+    if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
       // === Shared QP: refcount-based teardown ===
       INFO(NCCL_NET, "ANP TEARDOWN: anpNetCloseRecv commId=%d nqps=%d flushEnabled=%d ndevs=%d group=%d",
            comm->base.commId, comm->base.nqps, comm->flushEnabled,

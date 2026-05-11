@@ -182,6 +182,9 @@ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
 NCCL_PARAM(IbFifoTc, "IB_FIFO_TC", 0);
 NCCL_PARAM(IbAsyncEvents,"IB_RETURN_ASYNC_EVENTS",1);
 NCCL_PARAM(IbEceEnable,"IB_ECE_ENABLE",1);
+NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT",1);
+NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
+RCCL_PARAM(IbQpsPerP2p, "IB_QPS_PER_P2P", 0);
 RCCL_PARAM(IbAbortOnError, "IB_ABORT_ON_ERROR", 0);
 RCCL_PARAM(AnpCommNGroups, "ANP_COMM_NGROUPS", 0);
 RCCL_PARAM(AnpQpDepthMultiplier, "ANP_QP_DEPTH_MULTIPLIER", 1);
@@ -1572,8 +1575,6 @@ struct ncclIbRecvComm {
   int flushEnabled;
 };
 static_assert((offsetof(struct ncclIbRecvComm, remFifo) % 32) == 0, "ncclIbRecvComm fifo must be 32-byte aligned");
-
-NCCL_PARAM(IbQpsPerConn, "IB_QPS_PER_CONNECTION", 1);
 
 static void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex, struct ncclIbNetCommDevBase* base) {
   req->events[devIndex]++;

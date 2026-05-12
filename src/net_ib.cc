@@ -1520,6 +1520,7 @@ struct alignas(32) ncclIbNetCommBase {
   bool isSharedQpPrimary;       // true if this comm created the shared QPs
   int sharedGroupIdx;           // sharing group index (0..m-1)
   int remIbDevIdx;              // remote IB device index (for pool key in teardown)
+  int sharedPrimaryNqps;        // primary's nqps for QP index mapping in teardown (0 = primary or non-shared)
 };
 
 struct ncclIbSendComm {
@@ -1954,6 +1955,7 @@ ib_recv_dev_list:
       isSharedSecondary = true;
       int primaryNqps = anpCountGroupQpSlots(&checkKey.peerAddr,
           remoteVProps.devs[0], true, groupIdx);
+      comm->base.sharedPrimaryNqps = primaryNqps;
 
       anpSharedQpKey secKey;
       memset(&secKey, 0, sizeof(secKey));
@@ -2475,6 +2477,7 @@ ib_recv:
     acceptIsSharedSecondary = true;
     int primaryNqps = anpCountGroupQpSlots(&acceptLookupKey.peerAddr,
         remMeta.senderIbDevIdx, false, remMeta.sharedGroupIdx);
+    rComm->base.sharedPrimaryNqps = primaryNqps;
 
     anpSharedQpKey secKey;
     memset(&secKey, 0, sizeof(secKey));
@@ -3602,14 +3605,13 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
       TIME_START(3);
       // If we expect any completions from this device's CQ
       if (r->events[i]) {
-	
-	if (rcclParamIbAbortOnError()) {
-		NCCLCHECK(anp_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
-					wcs, &wrDone));
-	} else {
-		NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
-					wcs, &wrDone));
-	}
+        if (rcclParamIbAbortOnError()) {
+          NCCLCHECK(anp_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                    wcs, &wrDone));
+        } else {
+          NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                     wcs, &wrDone));
+        }
 
         totalWrDone += wrDone;
         ANP_TELEMETRY_EXECUTE(
@@ -3702,8 +3704,9 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
                     return ncclInternalError;
                   }
 
-                  // Size from wc->byte_len (cqe.status_length = reth.dma_len), not imm_data
-                  targetReq->recv.sizes[0] = wc->byte_len;
+                  if (targetReq->nreqs == 1) {
+                    targetReq->recv.sizes[0] = wc->byte_len;
+                  }
                   targetReq->events[i]--;
                 } else {
                   // === Shared plugin, but non-shared comm legacy recv path ===
@@ -3778,8 +3781,10 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
 
       for (int q = 0; q < comm->base.nqps; q++) {
         // Use full key lookup instead of QPN (QPN can collide across pool entries)
+        // For secondaries, map q back to primary's range (same as setup)
         slot0Key.ibDevN = comm->base.vProps.devs[comm->base.qps[q].devIndex];
-        slot0Key.qpIdx = q;
+        slot0Key.qpIdx = (comm->base.sharedPrimaryNqps > 0)
+                       ? (q % comm->base.sharedPrimaryNqps) : q;
         struct anpSharedQp* shared = anpFindSharedQp(&slot0Key);
         if (shared) {
           INFO(NCCL_NET, "ANP TEARDOWN: send close commId=%d qp[%d] qpn=%u refcount %d->%d %s",
@@ -3871,8 +3876,10 @@ ncclResult_t anpNetCloseRecv(void* recvComm) {
 
       for (int q = 0; q < comm->base.nqps; q++) {
         // Use full key lookup instead of QPN (QPN can collide across pool entries)
+        // For secondaries, map q back to primary's range (same as setup)
         slot0Key.ibDevN = comm->base.vProps.devs[comm->base.qps[q].devIndex];
-        slot0Key.qpIdx = q;
+        slot0Key.qpIdx = (comm->base.sharedPrimaryNqps > 0)
+                       ? (q % comm->base.sharedPrimaryNqps) : q;
         struct anpSharedQp* shared = anpFindSharedQp(&slot0Key);
         if (shared) {
           INFO(NCCL_NET, "ANP TEARDOWN: recv close commId=%d qp[%d] qpn=%u refcount %d->%d %s",

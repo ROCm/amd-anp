@@ -141,8 +141,6 @@ struct alignas(64) ncclIbDev {
   char* virtualPciPath;
   int realPort;
   int maxQp;
-  int maxQpWr;   // device max send/recv WRs per QP — guards depth multiplier clamping
-  int maxCqe;    // device max CQ entries — guards depth multiplier clamping
   float latency;
   struct ncclIbMrCache mrCache;
   int ar; // ADAPTIVE_ROUTING
@@ -956,8 +954,6 @@ ncclResult_t anpNetInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
               ncclIbDevs[ncclNIbDevs].capsProvider.mlx5.dataDirect = 1;
             }
             ncclIbDevs[ncclNIbDevs].maxQp = devAttr.max_qp;
-            ncclIbDevs[ncclNIbDevs].maxQpWr = devAttr.max_qp_wr;
-            ncclIbDevs[ncclNIbDevs].maxCqe = devAttr.max_cqe;
             ncclIbDevs[ncclNIbDevs].mrCache.capacity = 0;
             ncclIbDevs[ncclNIbDevs].mrCache.population = 0;
             ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
@@ -1009,6 +1005,7 @@ ncclResult_t anpNetInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
 
     pthread_mutex_unlock(&ncclIbLock);
   }
+
 exit:
   return ret;
 fail:
@@ -1165,9 +1162,10 @@ struct ncclIbConnectionMetadata {
   int tc;
   int sl;
   int isP2p;
-  uint32_t senderPid;    // sender's PID — used as key field for comm group matching on accept side
-  uint16_t commId;       // sender/receiver's commId for imm_data-based completion routing
-  uint8_t  commGroupIdx; // comm group index (0..G-1) — accept side uses this for its own grouping
+  // QP Sharing fields
+  int      sharedGroupIdx;
+  uint16_t commId;
+  int      senderIbDevIdx;
 };
 
 enum ncclIbCommState {
@@ -1193,172 +1191,9 @@ struct ncclIbCommStage {
 struct ncclIbHandle {
   union ncclSocketAddress connectAddr; // Filled by the target
   uint64_t magic; // random number to help debugging
-  int isP2p; // P2P flag
-  uint32_t peerPid; // PID of the listening process — scopes comm grouping per remote rank
+  int isP2p;
   struct ncclIbCommStage stage; // Used by the other side when connecting
 };
-
-// ============================================================
-// Comm Grouping Infrastructure
-//
-// Multiple RCCL channels between the same pair of NICs (in one
-// direction) are assigned to comm groups.  Each group shares a
-// single QP and CQ, reducing HCA resource consumption.  Comms
-// are round-robin assigned to groups: commGroupIdx = seq % G,
-// where G = NCCL_ANP_COMM_NGROUPS.
-// ============================================================
-
-struct anpCommGroupKey {
-  int             ibDevN;       // local IB device index
-  union ncclSocketAddress peerAddr; // remote IP (port stripped)
-  uint32_t        peerPid;      // remote rank's PID — disambiguates processes on same host
-  bool            isSend;       // send vs recv direction
-  int             groupIdx;     // which group (0..G-1) this comm was assigned to
-};
-
-struct anpCommGroup {
-  struct anpCommGroupKey key;
-  struct ibv_qp*      qp;           // QP shared by all comms in this group
-  struct ibv_cq*      cq;           // CQ shared by all comms in this group (created by primary)
-  struct ncclIbNetCommDevBase* primaryDevBase; // dev base of the primary comm (owns CQ/PD lifetime)
-  int                 ibDevN;       // TODO: remove — redundant with key.ibDevN, used only in logs
-  int                 refcount;     // number of comms using this group's QP+CQ
-  int                 devIndex;     // dev index within the primary comm's devs[] array
-  int                 remDevIdx;    // remote device index for QP connection
-  struct ibv_ece      ece;          // ECE capabilities negotiated for this QP
-  int                 eceSupported; // whether ECE is supported
-  uint32_t            groupHash;    // TODO: remove — FNV-1a hash of key, used only in log messages
-  bool                inUse;        // slot is occupied in gCommGroupPool
-};
-
-// Max comm group pool entries per process.
-// Total groups = nLocalNICs × nRemotePeers × 2 (send+recv) × G (NCCL_ANP_COMM_NGROUPS).
-// Typical RCCL ring/tree: 8 NICs × ~4 peers/NIC × 2 × G=2 = 128.
-// Fully-connected topologies on large jobs may exceed this; pool exhaustion
-// is not fatal — the comm falls back to a dedicated QP.
-#define ANP_MAX_COMM_GROUPS    512
-static struct anpCommGroup gCommGroupPool[ANP_MAX_COMM_GROUPS];
-static int                 gNCommGroups = 0;
-
-struct anpCommDbEntry {
-  struct ncclIbNetCommBase* base;
-  bool inUse;
-};
-
-// Max concurrent comms per process for commId-based completion routing.
-// Total concurrent comms = nChannels × nRemotePeers × 2 (send+recv).
-// Typical: 32 channels × 31 peers × 2 = 1984.  4096 provides ~2x headroom.
-// commId is encoded in 16 bits of wr_id, so the hard ceiling is 65535.
-// If the table is full, anpCommDbEntryAdd returns ncclInternalError.
-#define ANP_MAX_COMMS    4096
-static struct anpCommDbEntry gCommDb[ANP_MAX_COMMS] = {};
-static uint16_t gNextCommId = 0;
-
-static bool anpCommGroupKeyMatch(const struct anpCommGroupKey* a,
-                                 const struct anpCommGroupKey* b) {
-  if (a->ibDevN != b->ibDevN) return false;
-  if (a->isSend != b->isSend) return false;
-  if (a->groupIdx != b->groupIdx) return false;
-  if (a->peerPid != b->peerPid) return false;
-  if (memcmp(&a->peerAddr, &b->peerAddr, sizeof(union ncclSocketAddress)) != 0)
-    return false;
-  return true;
-}
-
-static uint32_t anpComputeGroupHash(const struct anpCommGroupKey* key) {
-  uint32_t h = 0x811c9dc5;
-  const uint8_t* bytes = (const uint8_t*)key;
-  for (size_t i = 0; i < sizeof(*key); i++) {
-    h ^= bytes[i];
-    h *= 0x01000193;
-  }
-  return h ? h : 1;
-}
-
-static void anpStripPort(union ncclSocketAddress* addr) {
-  if (addr->sa.sa_family == AF_INET) {
-    addr->sin.sin_port = 0;
-  } else if (addr->sa.sa_family == AF_INET6) {
-    addr->sin6.sin6_port = 0;
-  }
-}
-
-static struct anpCommGroup* anpFindCommGroup(const struct anpCommGroupKey* key) {
-  for (int i = 0; i < ANP_MAX_COMM_GROUPS; i++) {
-    if (gCommGroupPool[i].inUse && anpCommGroupKeyMatch(&gCommGroupPool[i].key, key)) {
-      return &gCommGroupPool[i];
-    }
-  }
-  return NULL;
-}
-
-static struct anpCommGroup* anpFindCommGroupByQpn(uint32_t qpn) {
-  for (int i = 0; i < ANP_MAX_COMM_GROUPS; i++) {
-    if (gCommGroupPool[i].inUse && gCommGroupPool[i].qp &&
-        gCommGroupPool[i].qp->qp_num == qpn) {
-      return &gCommGroupPool[i];
-    }
-  }
-  return NULL;
-}
-
-// Compute which comm group index (0..G-1) the next comm should be assigned to.
-// Counts existing comms across all groups for this (ibDevN, peerAddr, isSend, peerPid)
-// tuple, then round-robins: groupIdx = totalComms % G.
-static int anpComputeCommGroupIdx(const struct anpCommGroupKey* key) {
-  int G = rcclParamAnpCommNGroups();
-  if (G < 1) G = 1;
-  int totalComms = 0;
-  for (int i = 0; i < ANP_MAX_COMM_GROUPS; i++) {
-    if (gCommGroupPool[i].inUse &&
-        gCommGroupPool[i].key.ibDevN == key->ibDevN &&
-        gCommGroupPool[i].key.isSend == key->isSend &&
-        gCommGroupPool[i].key.peerPid == key->peerPid &&
-        memcmp(&gCommGroupPool[i].key.peerAddr, &key->peerAddr,
-               sizeof(union ncclSocketAddress)) == 0) {
-      totalComms += gCommGroupPool[i].refcount;
-    }
-  }
-  return totalComms % G;
-}
-
-static struct anpCommGroup* anpAddCommGroup(const struct anpCommGroupKey* key,
-                                            struct ibv_qp* qp,
-                                            struct ibv_cq* cq,
-                                            struct ncclIbNetCommDevBase* primaryDevBase,
-                                            int devIndex, int remDevIdx) {
-  for (int i = 0; i < ANP_MAX_COMM_GROUPS; i++) {
-    if (!gCommGroupPool[i].inUse) {
-      struct anpCommGroup* entry = &gCommGroupPool[i];
-      memset(entry, 0, sizeof(*entry));
-      entry->key = *key;
-      entry->qp = qp;
-      entry->cq = cq;
-      entry->primaryDevBase = primaryDevBase;
-      entry->ibDevN = key->ibDevN;
-      entry->refcount = 1;
-      entry->devIndex = devIndex;
-      entry->remDevIdx = remDevIdx;
-      entry->groupHash = anpComputeGroupHash(key);
-      entry->inUse = true;
-      gNCommGroups++;
-      return entry;
-    }
-  }
-  WARN("NET/ANP: Comm group pool exhausted (%d entries)", ANP_MAX_COMM_GROUPS);
-  return NULL;
-}
-
-static void anpRemoveCommGroup(struct anpCommGroup* entry) {
-  INFO(NCCL_NET, "NET/ANP: Removing comm group entry groupHash=0x%x (pool count=%d->%d)",
-       entry->groupHash, gNCommGroups, gNCommGroups - 1);
-  entry->inUse = false;
-  gNCommGroups--;
-}
-
-// ============================================================
-// End Comm Grouping Infrastructure
-// ============================================================
 
 // Retain local RoCE address for error logging
 struct ncclIbGidInfo {
@@ -1403,12 +1238,6 @@ struct ncclIbRequest {
       int* sizes;
     } recv;
   };
-  // For non-grouped comms, recv completion is tracked via the events[] counters —
-  // when all events hit 0, the request is done.  For grouped comms, recv WQEs are
-  // posted on a shared QP so events[] tracking is skipped.  Instead, recv requests
-  // are queued in the pendingRecvReqs FIFO, and when a recv completion arrives via
-  // imm_data routing, the request is dequeued and groupRecvDone is set to true.
-  bool groupRecvDone;
 };
 
 struct ncclIbNetCommDevBase {
@@ -1432,7 +1261,8 @@ struct alignas(32) ncclIbSendFifo {
   uint8_t nreqs;
   uint16_t tag;
   uint32_t idx;
-  char padding[9];
+  uint8_t req_idx;     // receiver's request index for completion routing
+  char padding[8];
 } __attribute__((packed));
 
 struct ncclIbQp {
@@ -1445,6 +1275,222 @@ struct ncclIbQp {
   uint8_t data;
 #endif
 };
+
+// ============================================================
+// QP Sharing Infrastructure
+// ============================================================
+
+#define ANP_MAX_SHARED_QPS 1024
+#define ANP_MAX_COMMS 4096
+
+// Pool key — uniquely identifies a shared QP
+struct anpSharedQpKey {
+    int             ibDevN;              // local IB device index
+    union ncclSocketAddress peerAddr;    // remote peer address (port stripped)
+    int             remIbDevIdx;         // remote IB device index for disambiguation
+    bool            isSend;              // send vs recv direction
+    int             groupIdx;            // sharing group (0..m-1)
+    int             qpIdx;              // QP slot within the group (0..nqps-1)
+};
+
+// Pool entry — one per physical shared QP
+struct anpSharedQp {
+    anpSharedQpKey key;
+    struct ibv_qp* qp;                  // the physical QP
+    struct ibv_cq* primaryCq;           // CQ for this device in this group
+    struct ncclIbNetCommDevBase* primaryDevBase;  // device base of primary comm's CQ
+    int      devIndex;                   // local device index within comm->devs[]
+    int      refcount;                   // number of comms using this QP
+    int      cqRefcount;                 // comms using this group's CQs (tracked on qpIdx==0 only)
+    bool     used;                       // slot in use
+    int8_t   ctsQpSlot;                  // CTS signaling slot from primary
+};
+
+// Global comm table for completion routing (commId → comm pointer)
+struct anpCommTableEntry {
+    void*    comm;          // ncclIbSendComm* or ncclIbRecvComm*
+    bool     isSend;
+    bool     used;
+};
+
+// Pool and comm table globals
+static struct anpSharedQp g_sharedQpPool[ANP_MAX_SHARED_QPS];
+static int g_sharedQpPoolCount = 0;
+static struct anpCommTableEntry g_commTable[ANP_MAX_COMMS];
+static uint16_t g_nextCommId = 1;  // 0 reserved for "not shared"
+static pthread_mutex_t g_sharedQpLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Strip port from socket address for peer matching
+static void anpStripPort(union ncclSocketAddress* addr) {
+    if (addr->sa.sa_family == AF_INET) {
+        addr->sin.sin_port = 0;
+    } else if (addr->sa.sa_family == AF_INET6) {
+        addr->sin6.sin6_port = 0;
+    }
+}
+
+// Compare two pool keys
+static bool anpSharedQpKeyMatch(const anpSharedQpKey* a, const anpSharedQpKey* b) {
+    if (a->ibDevN != b->ibDevN) return false;
+    if (a->isSend != b->isSend) return false;
+    if (a->groupIdx != b->groupIdx) return false;
+    if (a->qpIdx != b->qpIdx) return false;
+    if (a->remIbDevIdx != b->remIbDevIdx) return false;
+    if (memcmp(&a->peerAddr, &b->peerAddr, sizeof(union ncclSocketAddress)) != 0) return false;
+    return true;
+}
+
+// Find a shared QP by key
+static struct anpSharedQp* anpFindSharedQp(const anpSharedQpKey* key) {
+    for (int i = 0; i < g_sharedQpPoolCount; i++) {
+        if (g_sharedQpPool[i].used && anpSharedQpKeyMatch(&g_sharedQpPool[i].key, key)) {
+            return &g_sharedQpPool[i];
+        }
+    }
+    return NULL;
+}
+
+// Find a shared QP by QP number and direction (for teardown)
+static struct anpSharedQp* anpFindSharedQpByQpn(uint32_t qpn, bool isSend) {
+    for (int i = 0; i < g_sharedQpPoolCount; i++) {
+        if (g_sharedQpPool[i].used && g_sharedQpPool[i].qp &&
+            g_sharedQpPool[i].key.isSend == isSend &&
+            g_sharedQpPool[i].qp->qp_num == qpn) {
+            return &g_sharedQpPool[i];
+        }
+    }
+    return NULL;
+}
+
+// Register a new shared QP in the pool
+static struct anpSharedQp* anpRegisterSharedQp(const anpSharedQpKey* key,
+    struct ibv_qp* qp, struct ibv_cq* primaryCq,
+    struct ncclIbNetCommDevBase* primaryDevBase, int devIndex, int initialRefcount) {
+
+    if (g_sharedQpPoolCount >= ANP_MAX_SHARED_QPS) {
+        WARN("ANP QP Sharing: pool full (%d entries)", ANP_MAX_SHARED_QPS);
+        return NULL;
+    }
+    struct anpSharedQp* entry = &g_sharedQpPool[g_sharedQpPoolCount++];
+    entry->key = *key;
+    entry->qp = qp;
+    entry->primaryCq = primaryCq;
+    entry->primaryDevBase = primaryDevBase;
+    entry->devIndex = devIndex;
+    entry->refcount = initialRefcount;
+    entry->cqRefcount = 0;
+    entry->used = true;
+    entry->ctsQpSlot = ANP_CTS_QP_SLOT_INVALID;
+    return entry;
+}
+
+// Count QP slots registered by the primary for a given group
+static int anpCountGroupQpSlots(const union ncclSocketAddress* peerAddr,
+    int remIbDevIdx, bool isSend, int groupIdx) {
+    int count = 0;
+    for (int i = 0; i < g_sharedQpPoolCount; i++) {
+        if (!g_sharedQpPool[i].used) continue;
+        if (g_sharedQpPool[i].key.isSend != isSend) continue;
+        if (g_sharedQpPool[i].key.groupIdx != groupIdx) continue;
+        if (g_sharedQpPool[i].key.remIbDevIdx != remIbDevIdx) continue;
+        if (memcmp(&g_sharedQpPool[i].key.peerAddr, peerAddr, sizeof(union ncclSocketAddress)) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+// Count total comms connected to a peer (for channelSeq computation)
+static int anpCountPeerTotalRefcount(int ibDevN, const union ncclSocketAddress* peerAddr,
+    int remIbDevIdx, bool isSend) {
+    int total = 0;
+    for (int i = 0; i < g_sharedQpPoolCount; i++) {
+        if (!g_sharedQpPool[i].used) continue;
+        if (g_sharedQpPool[i].key.qpIdx != 0) continue;
+        if (g_sharedQpPool[i].key.isSend != isSend) continue;
+        if (g_sharedQpPool[i].key.remIbDevIdx != remIbDevIdx) continue;
+        if (memcmp(&g_sharedQpPool[i].key.peerAddr, peerAddr, sizeof(union ncclSocketAddress)) == 0) {
+            total += g_sharedQpPool[i].refcount;
+        }
+    }
+    return total;
+}
+
+// Allocate a commId and register in the global comm table
+static uint16_t anpAllocCommId(void* comm, bool isSend) {
+    pthread_mutex_lock(&g_sharedQpLock);
+    if (g_nextCommId >= ANP_MAX_COMMS) {
+        pthread_mutex_unlock(&g_sharedQpLock);
+        WARN("NET/IB: commId pool exhausted (max %d), falling back to non-sharing", ANP_MAX_COMMS);
+        return 0;
+    }
+    uint16_t id = g_nextCommId++;
+    g_commTable[id].comm = comm;
+    g_commTable[id].isSend = isSend;
+    g_commTable[id].used = true;
+    pthread_mutex_unlock(&g_sharedQpLock);
+    return id;
+}
+
+// Free a commId
+static void anpFreeCommId(uint16_t commId) {
+    if (commId > 0 && commId < ANP_MAX_COMMS) {
+        pthread_mutex_lock(&g_sharedQpLock);
+        g_commTable[commId].used = false;
+        g_commTable[commId].comm = NULL;
+        pthread_mutex_unlock(&g_sharedQpLock);
+    }
+}
+
+// Destroy all CQs for a group when cqRefcount reaches 0
+static void anpCleanupGroupCqs(struct anpSharedQp* slot0Entry) {
+    struct ibv_cq* destroyedCqs[NCCL_IB_MAX_DEVS_PER_NIC];
+    int nDestroyed = 0;
+
+    for (int i = 0; i < g_sharedQpPoolCount; i++) {
+        if (!g_sharedQpPool[i].used) continue;
+        if (g_sharedQpPool[i].key.isSend != slot0Entry->key.isSend) continue;
+        if (g_sharedQpPool[i].key.groupIdx != slot0Entry->key.groupIdx) continue;
+        if (g_sharedQpPool[i].key.remIbDevIdx != slot0Entry->key.remIbDevIdx) continue;
+        if (memcmp(&g_sharedQpPool[i].key.peerAddr, &slot0Entry->key.peerAddr,
+                   sizeof(union ncclSocketAddress)) != 0) continue;
+
+        struct ibv_cq* cq = g_sharedQpPool[i].primaryCq;
+        bool alreadyDestroyed = false;
+        for (int j = 0; j < nDestroyed; j++) {
+            if (destroyedCqs[j] == cq) { alreadyDestroyed = true; break; }
+        }
+        if (!alreadyDestroyed && cq != NULL) {
+            INFO(NCCL_NET, "ANP TEARDOWN: destroying CQ %p group=%d ibDevN=%d isSend=%d remIbDev=%d qpIdx=%d refcount=%d",
+                 (void*)cq, g_sharedQpPool[i].key.groupIdx, g_sharedQpPool[i].key.ibDevN,
+                 g_sharedQpPool[i].key.isSend, g_sharedQpPool[i].key.remIbDevIdx,
+                 g_sharedQpPool[i].key.qpIdx, g_sharedQpPool[i].refcount);
+            ncclResult_t cqRet = wrap_ibv_destroy_cq(cq);
+            if (cqRet != ncclSuccess) {
+                WARN("ANP TEARDOWN: ibv_destroy_cq FAILED cq=%p errno=%d group=%d ibDevN=%d qpIdx=%d refcount=%d",
+                     (void*)cq, errno, g_sharedQpPool[i].key.groupIdx, g_sharedQpPool[i].key.ibDevN,
+                     g_sharedQpPool[i].key.qpIdx, g_sharedQpPool[i].refcount);
+            }
+            destroyedCqs[nDestroyed++] = cq;
+            if (g_sharedQpPool[i].primaryDevBase) {
+                int ibDevN2 = g_sharedQpPool[i].primaryDevBase->ibDevN;
+                pthread_mutex_lock(&ncclIbDevs[ibDevN2].lock);
+                INFO(NCCL_NET, "ANP TEARDOWN: pdRefs ibDevN=%d: %d->%d %s",
+                     ibDevN2, ncclIbDevs[ibDevN2].pdRefs, ncclIbDevs[ibDevN2].pdRefs - 1,
+                     (ncclIbDevs[ibDevN2].pdRefs == 1) ? "DEALLOC" : "");
+                if (0 == --ncclIbDevs[ibDevN2].pdRefs) {
+                    wrap_ibv_dealloc_pd(ncclIbDevs[ibDevN2].pd);
+                }
+                pthread_mutex_unlock(&ncclIbDevs[ibDevN2].lock);
+            }
+        }
+        g_sharedQpPool[i].used = false;
+    }
+}
+
+// ============================================================
+// End QP Sharing Infrastructure
+// ============================================================
 
 struct ncclIbRemSizesFifo {
   int elems[MAX_REQUESTS][NCCL_NET_IB_MAX_RECVS];
@@ -1484,44 +1530,13 @@ struct alignas(32) ncclIbNetCommBase {
   struct ncclIbDevInfo remDevs[NCCL_IB_MAX_DEVS_PER_NIC];
   // statistics about the comm
   struct ncclIbStats stats;
-  // Comm grouping: multiple comms share a QP+CQ to reduce HCA resource usage
-  uint16_t commId;          // unique ID for this comm, encoded in wr_id bits [63:48] for completion routing
-  uint16_t remCommId;       // remote peer's commId, sent in imm_data for recv completion routing
-  bool inCommGroup;         // true if this comm is part of a comm group
-  bool isPrimaryComm;       // true if this comm created the group's QP+CQ (responsible for destruction)
-  struct ibv_cq* groupCq;   // points to the group's shared CQ (NULL if not in a group)
-  uint8_t commGroupIdx;     // which comm group this comm belongs to (0..G-1)
-  // Pending recv FIFO: tracks recv requests for grouped comms since events[] tracking is skipped
-  struct ncclIbRequest* pendingRecvReqs[MAX_REQUESTS];
-  int pendingRecvHead;      // consumer index — advanced when a recv completion arrives via CQ
-  int pendingRecvTail;      // producer index — advanced when irecv posts a new recv
+  // QP Sharing fields
+  uint16_t commId;              // unique ID for completion routing (0 = not shared)
+  bool isSharedQpPrimary;       // true if this comm created the shared QPs
+  int sharedGroupIdx;           // sharing group index (0..m-1)
+  int remIbDevIdx;              // remote IB device index (for pool key in teardown)
+  int sharedPrimaryNqps;        // primary's nqps for QP index mapping in teardown (0 = primary or non-shared)
 };
-
-static ncclResult_t anpCommDbEntryAdd(struct ncclIbNetCommBase* base) {
-  uint16_t start = gNextCommId;
-  uint16_t id = start;
-  do {
-    if (!gCommDb[id].inUse) {
-      base->commId = id;
-      gCommDb[id].base = base;
-      gCommDb[id].inUse = true;
-      gNextCommId = (id + 1 >= ANP_MAX_COMMS) ? 0 : id + 1;
-      INFO(NCCL_NET, "NET/ANP: Assigned commId=%u to comm %p", id, base);
-      return ncclSuccess;
-    }
-    id = (id + 1 >= ANP_MAX_COMMS) ? 0 : id + 1;
-  } while (id != start);
-  WARN("NET/ANP: Comm table full (%d entries) — cannot assign commId", ANP_MAX_COMMS);
-  return ncclInternalError;
-}
-
-static void anpCommDbEntryRemove(uint16_t commId) {
-  if (commId < ANP_MAX_COMMS && gCommDb[commId].inUse) {
-    INFO(NCCL_NET, "NET/ANP: Unregistered commId=%u from comm table", commId);
-    gCommDb[commId].base = NULL;
-    gCommDb[commId].inUse = false;
-  }
-}
 
 struct ncclIbSendComm {
   struct ncclIbNetCommBase base;
@@ -1535,6 +1550,7 @@ struct ncclIbSendComm {
   struct ncclIbRemSizesFifo remSizesFifo;
   uint64_t fifoHead;
   int ar; // Use adaptive routing when all merged devices have it enabled
+  uint16_t remCommId;   // receiver's commId (from accept metadata, for imm_data)
 };
 // The SendFifo needs to be 32-byte aligned and each element needs
 // to be a 32-byte multiple, so that an entry does not get split and
@@ -1583,7 +1599,7 @@ static void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex, struct ncclI
   req->events[devIndex]++;
   req->devBases[devIndex] = base;
 }
-ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context, bool isPrimaryComm = false) {
+ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context) {
   base->ibDevN = ibDevN;
   ncclIbDev* ibDev = ncclIbDevs + ibDevN;
   pthread_mutex_lock(&ibDev->lock);
@@ -1599,22 +1615,13 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
   base->pd = ibDev->pd;
   pthread_mutex_unlock(&ibDev->lock);
 
-  int cqDepth = 3 * MAX_REQUESTS * ncclParamIbQpsPerConn();
-  if (isPrimaryComm && rcclParamAnpCommNGroups() > 0) {
-    int depthMul = rcclParamAnpQpDepthMultiplier();
-    if (depthMul < 1) depthMul = 1;
-    cqDepth *= depthMul;
-    if (ibDev->maxCqe > 0 && cqDepth > ibDev->maxCqe) {
-      WARN("NET/ANP: Comm group CQ depth %d exceeds device max %d, clamping", cqDepth, ibDev->maxCqe);
-      cqDepth = ibDev->maxCqe;
-    }
-  }
-  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, cqDepth, cq_context, NULL, 0));
+  // CQ is sized to accommodate the max SQ + RQ WQE completions. If each SQ WQE could be signaled, then,
+  // for each QP, there can be 2*MAX_REQUESTS completions for SQ and MAX_REQUESTS completions for RQ.
+  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, 3*MAX_REQUESTS*ncclParamIbQpsPerConn(), cq_context, NULL, 0));
 #ifdef ANP_DEBUG_TRACE_EN
-  INFO(NCCL_NET, "[ANP_TRACE] Created cq, ibDevN %d, handle %u, fd %d, refcount %d, cqe %d, isPrimary %d",
-       ibDevN, base->cq->handle,
+  INFO(NCCL_NET, "[ANP_TRACE] Created cq, ibDevN %d, handle %u, fd %d, refcount %d, cqe %d", ibDevN, base->cq->handle,
        base->cq->channel ? base->cq->channel->fd : -1,
-       base->cq->channel ? base->cq->channel->refcnt : -1, base->cq->cqe, isPrimaryComm);
+       base->cq->channel ? base->cq->channel->refcnt : -1, base->cq->cqe);
 #endif
 
   return ncclSuccess;
@@ -1634,6 +1641,16 @@ returning:
   return res;
 }
 
+// Create a CQ with scaled depth for shared QP primaries
+static ncclResult_t anpCreateScaledCq(int ibDevN, struct ibv_cq** cq, void* cq_context, int depthMultiplier) {
+    ncclIbDev* ibDev = ncclIbDevs + ibDevN;
+    int cqDepth = 3 * MAX_REQUESTS * ncclParamIbQpsPerConn() * depthMultiplier;
+    NCCLCHECK(wrap_ibv_create_cq(cq, ibDev->context, cqDepth, cq_context, NULL, 0));
+    return ncclSuccess;
+}
+
+// Print a one-shot sharing summary for a given peer direction.
+// Called on the first isend/irecv; the `printed` flag on slot-0 prevents repeats.
 typedef struct channel_ud_s_ {
     int channelId;
     bool ud_id;
@@ -1646,17 +1663,17 @@ static bool last_ud[128];
 
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
                             int access_flags, void* qp_context, struct ncclIbQp* qp,
-                            int channelId, bool dataQP, int8_t qp_idx, bool isPrimaryCommQp = false,
-                            int groupIdx = 0) {
+                            int channelId, bool dataQP, int8_t qp_idx, int nqps,
+                            int depthMultiplier = 1, int groupIdx = -1) {
   struct ibv_qp_init_attr qpInitAttr;
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
   qpInitAttr.qp_context = qp_context;
   qpInitAttr.send_cq = base->cq;
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
-  if (isPrimaryCommQp) {
-    bool useHigh = (groupIdx % 2 != 0);
-    wrap_ibv_pd_set_udma_mask(base->pd, useHigh ? IONIC_UDMA_MASK_HIGH : IONIC_UDMA_MASK_LOW);
+  if (groupIdx >= 0) {
+    uint8_t mask = (groupIdx % 2 == 0) ? IONIC_UDMA_MASK_LOW : IONIC_UDMA_MASK_HIGH;
+    wrap_ibv_pd_set_udma_mask(base->pd, mask);
   } else if (dataQP) {
     if (!data_channel_ud[channelId].ud_allocated) {
       bool lud = data_last_ud[base->ibDevN];
@@ -1689,39 +1706,14 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
     qpInitAttr.sq_sig_all &= (~(1 << 17));
   }
   qpInitAttr.sq_sig_all |= (1 << 18);
-
-  if (isPrimaryCommQp) {
-    qpInitAttr.sq_sig_all &= (~(1 << 19));
-  } else {
 #if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    qpInitAttr.sq_sig_all &= (~(1 << 19));
+  qpInitAttr.sq_sig_all &= (~(1 << 19));
 #else
-    qpInitAttr.sq_sig_all |= (1 << 19);
+  qpInitAttr.sq_sig_all |= (1 << 19);
 #endif
-  }
-
-  int maxSendWr = 2 * MAX_REQUESTS;
-  int maxRecvWr = MAX_REQUESTS;
-  if (isPrimaryCommQp) {
-    int depthMul = rcclParamAnpQpDepthMultiplier();
-    if (depthMul < 1) depthMul = 1;
-    maxSendWr *= depthMul;
-    maxRecvWr *= depthMul;
-    int deviceMaxWr = ncclIbDevs[base->ibDevN].maxQpWr;
-    if (deviceMaxWr > 0) {
-      maxSendWr = std::min(maxSendWr, deviceMaxWr);
-      maxRecvWr = std::min(maxRecvWr, deviceMaxWr);
-      if (maxSendWr < 2 * MAX_REQUESTS || maxRecvWr < MAX_REQUESTS) {
-        WARN("NET/ANP: Device max_qp_wr=%d too small for comm group QP (need send=%d recv=%d)",
-             deviceMaxWr, 2 * MAX_REQUESTS, MAX_REQUESTS);
-        return ncclInternalError;
-      }
-    }
-    INFO(NCCL_NET, "NET/ANP: Creating comm group QP with SQ=%d RQ=%d (depth multiplier=%ld)",
-         maxSendWr, maxRecvWr, rcclParamAnpQpDepthMultiplier());
-  }
-  qpInitAttr.cap.max_send_wr = maxSendWr;
-  qpInitAttr.cap.max_recv_wr = maxRecvWr;
+  // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
+  qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS * depthMultiplier;
+  qpInitAttr.cap.max_recv_wr = MAX_REQUESTS * depthMultiplier;
   qpInitAttr.cap.max_send_sge = 1;
   qpInitAttr.cap.max_recv_sge = 1;
 #if defined(CTS_INLINE_ENABLED)
@@ -1729,10 +1721,10 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
 #else
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
 #endif
-  if (isPrimaryCommQp && qpInitAttr.cap.max_inline_data < sizeof(int)) {
-    qpInitAttr.cap.max_inline_data = sizeof(int);
-  }
   NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
+  INFO(NCCL_NET, "ANP QP Created: qpn=%u requested send_wr=%d recv_wr=%d, granted send_wr=%d recv_wr=%d depthMult=%d",
+       qp->qp->qp_num, 2*MAX_REQUESTS*depthMultiplier, MAX_REQUESTS*depthMultiplier,
+       qpInitAttr.cap.max_send_wr, qpInitAttr.cap.max_recv_wr, depthMultiplier);
   ANP_TELEMETRY_EXECUTE(
       g_anp_state.add_queue_pair(base->ibDevN, channelId, qp->qp->qp_num, dataQP);
   );
@@ -1835,7 +1827,6 @@ ncclResult_t anpNetListen(int dev, void* opaqueHandle, void** listenComm) {
   NCCLCHECKGOTO(ncclSocketInit(&comm->sock, &ncclIbIfAddr, handle->magic, ncclSocketTypeNetIb, NULL, 1), ret, fail);
   NCCLCHECKGOTO(ncclSocketListen(&comm->sock), ret, fail);
   NCCLCHECKGOTO(ncclSocketGetAddr(&comm->sock, &handle->connectAddr), ret, fail);
-  handle->peerPid = (uint32_t)getpid();
   *listenComm = comm;
 exit:
   return ret;
@@ -1854,8 +1845,6 @@ ncclResult_t anpNetConnect(int dev, ncclNetCommConfig_t* config, void* opaqueHan
   uint8_t link_layer = IBV_LINK_LAYER_UNSPECIFIED;
   int isP2p = 0;
   *sendComm = NULL;
-  struct anpCommGroup* commGroup = NULL;
-  int commGroupIdx = 0;
 
   int channelId = ((ncclNet_ctxt_t *)ncclNetCtxt)->chId;
   if (stage->state == ncclIbCommStateConnect)      goto ib_connect_check;
@@ -1925,137 +1914,193 @@ ib_recv_dev_list:
   ANP_TELEMETRY_EXECUTE(
     g_anp_state.set_device_name(dev, "", mergedDev->devName);
   );
-  comm->base.inCommGroup = false;
-  comm->base.isPrimaryComm = false;
-  comm->base.groupCq = NULL;
-
   // Init PD, Ctx for each IB device
   comm->ar = 1; // Set to 1 for logic
-
-  // Check if we can share a QP with a previously-connected channel
-  if (rcclParamAnpCommNGroups() > 0 && comm->base.vProps.ndevs > 0) {
-    struct anpCommGroupKey lookupKey;
-    memset(&lookupKey, 0, sizeof(lookupKey));
-    lookupKey.ibDevN = comm->base.vProps.devs[0];
-    memcpy(&lookupKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
-    anpStripPort(&lookupKey.peerAddr);
-    lookupKey.peerPid = handle->peerPid;
-    lookupKey.isSend = true;
-
-    commGroupIdx = anpComputeCommGroupIdx(&lookupKey);
-    lookupKey.groupIdx = commGroupIdx;
-
-    commGroup = anpFindCommGroup(&lookupKey);
-    {
-      char connAddrStr[SOCKET_NAME_MAXLEN] = "";
-      ncclSocketToString(&handle->connectAddr, connAddrStr, 1);
-      INFO(NCCL_NET, "NET/ANP/CG: connect ch %d lookup: ibDevN=%d localDev=%s peerAddr=%s "
-           "peerPid=%u groupIdx=%d G=%ld -> %s qpn=%u refcount=%d",
-           channelId, lookupKey.ibDevN, ncclIbDevs[lookupKey.ibDevN].devName,
-           connAddrStr, lookupKey.peerPid,
-           commGroupIdx, rcclParamAnpCommNGroups(),
-           commGroup ? "REUSE" : "NEW",
-           commGroup ? commGroup->qp->qp_num : 0,
-           commGroup ? commGroup->refcount : 0);
-    }
-  }
-  comm->base.commGroupIdx = commGroupIdx;
-
-  bool isPrimaryComm;
-  isPrimaryComm = (rcclParamAnpCommNGroups() > 0 && commGroup == NULL);
-
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     int ibDevN = comm->base.vProps.devs[i];
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats,
-                  isPrimaryComm), ret, fail);
-    comm->ar = comm->ar && ncclIbDevs[ibDevN].ar;
+    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats), ret, fail);
+    comm->ar = comm->ar && ncclIbDevs[ibDevN].ar; // ADAPTIVE_ROUTING - if all merged devs have it enabled
   }
-
-  // Assign commId for wr_id encoding
-  NCCLCHECKGOTO(anpCommDbEntryAdd(&comm->base), ret, fail);
 
   memset(&meta, 0, sizeof(meta));
   meta.ndevs = comm->base.vProps.ndevs;
   meta.isP2p = isP2p;
-  // Alternate QPs between devices
-  int devIndex;
-  devIndex = 0;
 
-  if (commGroup) {
-    // Reuse existing comm group QP
-    for (int q = 0; q < comm->base.nqps; q++) {
-      comm->base.qps[q].qp = commGroup->qp;
-      comm->base.qps[q].devIndex = commGroup->devIndex;
-      comm->base.qps[q].remDevIdx = commGroup->remDevIdx;
-      comm->base.qps[q].ctsQpSlot = ANP_CTS_QP_SLOT_INVALID;
-      meta.qpInfo[q].qpn = commGroup->qp->qp_num;
-      meta.qpInfo[q].devIndex = commGroup->devIndex;
-      if (commGroup->eceSupported) {
-        meta.qpInfo[q].ece = commGroup->ece;
-        meta.qpInfo[q].ece_supported = commGroup->eceSupported;
+  // Init QP sharing fields
+  comm->base.commId = 0;
+  comm->base.isSharedQpPrimary = false;
+  comm->base.sharedGroupIdx = -1;
+  comm->base.remIbDevIdx = 0;
+  comm->remCommId = 0;
+
+  // QP Sharing: determine group assignment and primary/secondary role
+  int groupIdx;
+  groupIdx = 0;
+  bool isSharedSecondary;
+  isSharedSecondary = false;
+
+  if (rcclParamAnpCommNGroups() > 0) {
+    comm->base.commId = anpAllocCommId(comm, true);
+  }
+  if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
+    // Build probe key to count existing comms to this peer
+    anpSharedQpKey probeKey;
+    memset(&probeKey, 0, sizeof(probeKey));
+    probeKey.ibDevN = comm->base.vProps.devs[0];
+    memcpy(&probeKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
+    anpStripPort(&probeKey.peerAddr);
+    probeKey.remIbDevIdx = remoteVProps.devs[0];
+    probeKey.isSend = true;
+
+    int channelSeq = anpCountPeerTotalRefcount(
+        probeKey.ibDevN, &probeKey.peerAddr, probeKey.remIbDevIdx, true);
+    groupIdx = channelSeq % rcclParamAnpCommNGroups();
+    comm->base.sharedGroupIdx = groupIdx;
+    comm->base.remIbDevIdx = remoteVProps.devs[0];
+
+    // Check if primary already exists for this group
+    anpSharedQpKey checkKey;
+    memset(&checkKey, 0, sizeof(checkKey));
+    memcpy(&checkKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
+    anpStripPort(&checkKey.peerAddr);
+    checkKey.remIbDevIdx = remoteVProps.devs[0];
+    checkKey.isSend = true;
+    checkKey.groupIdx = groupIdx;
+    checkKey.ibDevN = comm->base.vProps.devs[0];
+    checkKey.qpIdx = 0;
+    struct anpSharedQp* sharedSlot0 = anpFindSharedQp(&checkKey);
+
+    if (sharedSlot0 != NULL) {
+      // SECONDARY: reuse existing shared QPs
+      isSharedSecondary = true;
+      int primaryNqps = anpCountGroupQpSlots(&checkKey.peerAddr,
+          remoteVProps.devs[0], true, groupIdx);
+      comm->base.sharedPrimaryNqps = primaryNqps;
+
+      anpSharedQpKey secKey;
+      memset(&secKey, 0, sizeof(secKey));
+      memcpy(&secKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
+      anpStripPort(&secKey.peerAddr);
+      secKey.isSend = true;
+      secKey.groupIdx = groupIdx;
+
+      for (int q = 0; q < comm->base.nqps; q++) {
+        int mappedQ = q % primaryNqps;
+        int localDevIdx = mappedQ % comm->base.vProps.ndevs;
+        int remDevIdx   = mappedQ % remoteVProps.ndevs;
+        secKey.ibDevN = comm->base.vProps.devs[localDevIdx];
+        secKey.remIbDevIdx = remoteVProps.devs[remDevIdx];
+        secKey.qpIdx = mappedQ;
+
+        struct anpSharedQp* sqe = anpFindSharedQp(&secKey);
+        if (!sqe) {
+          WARN("ANP QP Sharing: secondary could not find QP group=%d qpIdx=%d (mapped from %d)", groupIdx, mappedQ, q);
+          return ncclInternalError;
+        }
+        comm->base.qps[q].qp = sqe->qp;
+        comm->base.qps[q].devIndex = sqe->devIndex;
+        comm->base.qps[q].ctsQpSlot = sqe->ctsQpSlot;
+        meta.qpInfo[q].qpn = sqe->qp->qp_num;
+        meta.qpInfo[q].devIndex = sqe->devIndex;
+        sqe->refcount++;
       }
+      // Redirect CQs to primary's per-device CQs
+      for (int d = 0; d < comm->base.vProps.ndevs; d++) {
+        secKey.ibDevN = comm->base.vProps.devs[d];
+        secKey.qpIdx = d;
+        struct anpSharedQp* devEntry = anpFindSharedQp(&secKey);
+        if (devEntry) {
+          wrap_ibv_destroy_cq(comm->devs[d].base.cq);
+          comm->devs[d].base.cq = devEntry->primaryCq;
+        }
+      }
+      sharedSlot0->cqRefcount++;
+
+      meta.sharedGroupIdx = groupIdx;
+      meta.commId = comm->base.commId;
+      meta.senderIbDevIdx = comm->base.vProps.devs[0];
+
+      INFO(NCCL_NET, "ANP QP Sharing: SECONDARY connect ch=%d group=%d commId=%d nqps=%d qpn[0]=%d",
+           channelId, groupIdx, comm->base.commId, comm->base.nqps, meta.qpInfo[0].qpn);
     }
-    comm->base.inCommGroup = true;
-    comm->base.isPrimaryComm = false;
-    comm->base.groupCq = commGroup->cq;
-    commGroup->refcount++;
-    meta.commGroupIdx = commGroupIdx;
-    INFO(NCCL_NET, "NET/ANP: ch %d reusing comm group QP qpn=%d group=%d (refcount=%d, groupHash=0x%x)",
-         channelId, commGroup->qp->qp_num, commGroupIdx, commGroup->refcount, commGroup->groupHash);
-  } else {
+  }
+
+  if (rcclParamAnpCommNGroups() > 0 && !isSharedSecondary) {
+    // PRIMARY: create QPs with scaled depth
+    comm->base.isSharedQpPrimary = true;
+    int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
+
+    // Recreate CQs with scaled depth for each device
+    for (int d = 0; d < comm->base.vProps.ndevs; d++) {
+      int ibDevN = comm->base.vProps.devs[d];
+      wrap_ibv_destroy_cq(comm->devs[d].base.cq);
+      NCCLCHECKGOTO(anpCreateScaledCq(ibDevN, &comm->devs[d].base.cq, &comm->base.stats, depthMult), ret, fail);
+    }
+
+    int devIndex = 0;
     for (int q = 0; q < comm->base.nqps; q++) {
       ncclIbSendCommDev* commDev = comm->devs + devIndex;
       ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE,
-                    &comm->base.stats, comm->base.qps + q, channelId, true, q,
-                    isPrimaryComm, commGroupIdx), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q, channelId, true, q, comm->base.nqps, depthMult, groupIdx), ret, fail);
       comm->base.qps[q].devIndex = devIndex;
       meta.qpInfo[q].qpn      = comm->base.qps[q].qp->qp_num;
       meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
-#ifdef ANP_DEBUG_TRACE_EN
-      INFO(NCCL_NET, "[ANP_TRACE] Created data QP %d, ch %d, dev index %d, isPrimary=%d",
-           comm->base.qps[q].qp->qp_num, channelId, comm->base.qps[q].devIndex, isPrimaryComm);
-#endif
-
-    if (ncclParamIbEceEnable()) {
-      NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
-    } else {
-      meta.qpInfo[q].ece_supported = 0;
-    }
+      if (ncclParamIbEceEnable()) {
+        NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+      } else {
+        meta.qpInfo[q].ece_supported = 0;
+      }
       devIndex = (devIndex + 1) % comm->base.vProps.ndevs;
     }
 
-    // Add primary comm's QP to comm group pool
-    if (isPrimaryComm && comm->base.nqps > 0) {
-      struct anpCommGroupKey commGroupKey;
-      memset(&commGroupKey, 0, sizeof(commGroupKey));
-      commGroupKey.ibDevN = comm->base.vProps.devs[0];
-      memcpy(&commGroupKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
-      anpStripPort(&commGroupKey.peerAddr);
-      commGroupKey.peerPid = handle->peerPid;
-      commGroupKey.isSend = true;
-      commGroupKey.groupIdx = commGroupIdx;
-      int ownerDevIdx = comm->base.qps[0].devIndex;
-      struct anpCommGroup* newCommGroup = anpAddCommGroup(&commGroupKey,
-          comm->base.qps[0].qp, comm->devs[ownerDevIdx].base.cq,
-          &comm->devs[ownerDevIdx].base, ownerDevIdx, 0);
-      if (newCommGroup) {
-        if (ncclParamIbEceEnable() && comm->base.nqps > 0) {
-          newCommGroup->ece = meta.qpInfo[0].ece;
-          newCommGroup->eceSupported = meta.qpInfo[0].ece_supported;
-        }
-        meta.commGroupIdx = commGroupIdx;
-        comm->base.inCommGroup = true;
-        comm->base.isPrimaryComm = true;
-        comm->base.groupCq = newCommGroup->cq;
-        INFO(NCCL_NET, "NET/ANP/CG: connect ch %d REGISTERED: ibDevN=%d localDev=%s qpn=%u "
-             "groupHash=0x%x devIndex=%d remDevIdx=%d peerPid=%u",
-             channelId, commGroupKey.ibDevN, ncclIbDevs[commGroupKey.ibDevN].devName,
-             newCommGroup->qp->qp_num, newCommGroup->groupHash,
-             newCommGroup->devIndex, newCommGroup->remDevIdx, commGroupKey.peerPid);
+    // Register all QP slots in pool
+    for (int q = 0; q < comm->base.nqps; q++) {
+      int localDevIdx = q % comm->base.vProps.ndevs;
+      int remDevIdx   = q % remoteVProps.ndevs;
+
+      anpSharedQpKey regKey;
+      memset(&regKey, 0, sizeof(regKey));
+      memcpy(&regKey.peerAddr, &handle->connectAddr, sizeof(union ncclSocketAddress));
+      anpStripPort(&regKey.peerAddr);
+      regKey.ibDevN = comm->base.vProps.devs[localDevIdx];
+      regKey.remIbDevIdx = remoteVProps.devs[remDevIdx];
+      regKey.isSend = true;
+      regKey.groupIdx = groupIdx;
+      regKey.qpIdx = q;
+
+      struct anpSharedQp* entry = anpRegisterSharedQp(&regKey,
+          comm->base.qps[q].qp, comm->devs[localDevIdx].base.cq,
+          &comm->devs[localDevIdx].base, comm->base.qps[q].devIndex, 1);
+      if (entry) {
+        entry->ctsQpSlot = comm->base.qps[q].ctsQpSlot;
+        if (q == 0) entry->cqRefcount = 1;
       }
     }
-  } // end if(commGroup) else
+
+    meta.sharedGroupIdx = groupIdx;
+    meta.commId = comm->base.commId;
+    meta.senderIbDevIdx = comm->base.vProps.devs[0];
+
+    INFO(NCCL_NET, "ANP QP Sharing: PRIMARY connect ch=%d group=%d commId=%d nqps=%d depthMult=%d qpn[0]=%d",
+         channelId, groupIdx, comm->base.commId, comm->base.nqps, depthMult, meta.qpInfo[0].qpn);
+  } else if (!isSharedSecondary) {
+    // NON-SHARING: original QP creation loop
+    int devIndex = 0;
+    for (int q = 0; q < comm->base.nqps; q++) {
+      ncclIbSendCommDev* commDev = comm->devs + devIndex;
+      ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q, channelId, true, q, comm->base.nqps), ret, fail);
+      comm->base.qps[q].devIndex = devIndex;
+      meta.qpInfo[q].qpn      = comm->base.qps[q].qp->qp_num;
+      meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
+      if (ncclParamIbEceEnable()) {
+        NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+      } else {
+        meta.qpInfo[q].ece_supported = 0;
+      }
+      devIndex = (devIndex + 1) % comm->base.vProps.ndevs;
+    }
+  }
 
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     ncclIbSendCommDev* commDev = comm->devs + i;
@@ -2111,21 +2156,9 @@ ib_recv_dev_list:
     }
   }
   meta.fifoAddr = (uint64_t)comm->fifo;
-  meta.commId = comm->base.commId;
-  meta.senderPid = (uint32_t)getpid();
   meta.sl = (ncclParamIbSl() != 0) ? ncclParamIbSl() : (config && config->trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? config->trafficClass : NCCL_IB_SL_DEFAULT;
   meta.tc = (ncclParamIbTc() != 0) ? ncclParamIbTc() : (config && config->trafficClass != NCCL_NET_TRAFFIC_CLASS_UNDEF) ? config->trafficClass : NCCL_IB_TC_DEFAULT;
   strncpy(meta.devName, mergedDev->devName, MAX_MERGED_DEV_NAME);
-
-  {
-    char connAddrStr[SOCKET_NAME_MAXLEN] = "";
-    ncclSocketToString(&handle->connectAddr, connAddrStr, 1);
-    INFO(NCCL_NET, "NET/ANP/CG: connect ch %d SEND meta: commId=%u "
-         "groupIdx=%u qpn=%u localDev=%s peerAddr=%s inCommGroup=%d isPrimary=%d",
-         channelId, meta.commId, meta.commGroupIdx,
-         meta.qpInfo[0].qpn, mergedDev->devName, connAddrStr,
-         comm->base.inCommGroup, comm->base.isPrimaryComm);
-  }
 
   stage->state = ncclIbCommStateSend;
   stage->offset = 0;
@@ -2149,7 +2182,6 @@ ib_connect:
   memcpy(&remMeta, stage->buffer, sizeof(ncclIbConnectionMetadata));
 
   comm->base.nRemDevs = remMeta.ndevs;
-  comm->base.remCommId = remMeta.commId;
 
   // ensure that the remote devices have the same link layer than the local devices used in the connection.
   if (comm->base.vProps.ndevs > 0) {
@@ -2179,43 +2211,54 @@ ib_connect:
   }
   comm->base.nRemDevs = remMeta.ndevs;
 
-  for (int q = 0; q < comm->base.nqps; q++) {
-    struct ncclIbQpInfo* remQpInfo   = remMeta.qpInfo + q;
-    struct ncclIbDevInfo* remDevInfo = remMeta.devs + remQpInfo->devIndex;
+  // QP Sharing: capture receiver's commId for imm_data encoding
+  if (rcclParamAnpCommNGroups() > 0) {
+    comm->remCommId = remMeta.commId;
+  }
 
-    // Assign per-QP remDev
-    comm->base.qps[q].remDevIdx = remQpInfo->devIndex;
-    int devIndex = comm->base.qps[q].devIndex;
-    ncclIbSendCommDev* commDev = comm->devs + devIndex;
+  // RTR/RTS: skip for shared QP secondaries (QPs already in RTS state)
+  if (comm->base.commId == 0 || comm->base.isSharedQpPrimary) {
+    INFO(NCCL_NET, "ANP QP Sharing: Connect RTR/RTS commId=%d isPrimary=%d nqps=%d remQpn[0]=%d",
+         comm->base.commId, comm->base.isSharedQpPrimary, comm->base.nqps, remMeta.qpInfo[0].qpn);
+    for (int q = 0; q < comm->base.nqps; q++) {
+      struct ncclIbQpInfo* remQpInfo   = remMeta.qpInfo + q;
+      struct ncclIbDevInfo* remDevInfo = remMeta.devs + remQpInfo->devIndex;
 
-    struct ibv_qp* qp = comm->base.qps[q].qp;
+      // Assign per-QP remDev
+      comm->base.qps[q].remDevIdx = remQpInfo->devIndex;
+      int devIndex = comm->base.qps[q].devIndex;
+      ncclIbSendCommDev* commDev = comm->devs + devIndex;
 
-    // Skip RTR/RTS if reusing a comm group QP that's already connected
-    if (comm->base.inCommGroup && !comm->base.isPrimaryComm) {
-      // QP already in RTS state from the owner channel
-      continue;
-    }
+      struct ibv_qp* qp = comm->base.qps[q].qp;
+      if (remQpInfo->ece_supported) {
+        struct ncclIbQp* nqp = comm->base.qps + q;
+        int ibDevN = comm->devs[nqp->devIndex].base.ibDevN;
+        struct ncclIbDev* ibDev = ncclIbDevs + ibDevN;
+        INFO(NCCL_NET,"NET/IB: IbDev %d Port %d qpn %d set_ece={supported=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x}",
+          ibDevN, ibDev->portNum, qp->qp_num, remMeta.qpInfo[q].ece_supported, remMeta.qpInfo[q].ece.vendor_id, remMeta.qpInfo[q].ece.options, remMeta.qpInfo[q].ece.comp_mask);
+        NCCLCHECKGOTO(wrap_ibv_set_ece(qp, &remQpInfo->ece, &remQpInfo->ece_supported), ret, fail);
+      }
 
-    if (remQpInfo->ece_supported) {
-      struct ncclIbQp* nqp = comm->base.qps + q;
-      int ibDevN = comm->devs[nqp->devIndex].base.ibDevN;
-      struct ncclIbDev* ibDev = ncclIbDevs + ibDevN;
-      INFO(NCCL_NET,"NET/IB: IbDev %d Port %d qpn %d set_ece={supported=%d, vendor_id=0x%x, options=0x%x, comp_mask=0x%x}",
-        ibDevN, ibDev->portNum, qp->qp_num, remMeta.qpInfo[q].ece_supported, remMeta.qpInfo[q].ece.vendor_id, remMeta.qpInfo[q].ece.options, remMeta.qpInfo[q].ece.comp_mask);
-      NCCLCHECKGOTO(wrap_ibv_set_ece(qp, &remQpInfo->ece, &remQpInfo->ece_supported), ret, fail);
-    }
-
-    ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
-    remDevInfo->mtu = std::min(remDevInfo->mtu, ibDev->portAttr.active_mtu);
-    NCCLCHECKGOTO(ncclIbRtrQp(qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false, remMeta.tc, remMeta.sl), ret, fail);
-    NCCLCHECKGOTO(ncclIbRtsQp(qp), ret, fail);
+      ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
+      remDevInfo->mtu = std::min(remDevInfo->mtu, ibDev->portAttr.active_mtu);
+      NCCLCHECKGOTO(ncclIbRtrQp(qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false, remMeta.tc, remMeta.sl), ret, fail);
+      NCCLCHECKGOTO(ncclIbRtsQp(qp), ret, fail);
 #ifdef ANP_DEBUG_TRACE_EN
-    INFO(NCCL_NET, "[ANP_TRACE] sendcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d",
-         comm, comm->base.qps[q].channelId, comm->base.qps[q].data ? "data" : "cts",
-         comm->base.qps[q].qp->qp_num,
-         comm->devs[comm->base.qps[q].devIndex].base.ibDevN,
-         comm->base.remDevs[comm->base.qps[q].remDevIdx].ibv_dev_index);
+      INFO(NCCL_NET, "[ANP_TRACE] sendcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d",
+           comm, comm->base.qps[q].channelId, comm->base.qps[q].data ? "data" : "cts",
+           comm->base.qps[q].qp->qp_num,
+           comm->devs[comm->base.qps[q].devIndex].base.ibDevN,
+           comm->base.remDevs[comm->base.qps[q].remDevIdx].ibv_dev_index);
 #endif
+    }
+  } else {
+    // Secondary: just set remDevIdx from remote metadata
+    INFO(NCCL_NET, "ANP QP Sharing: Connect SKIP RTR/RTS (secondary) commId=%d remQpn[0]=%d remCommId=%d",
+         comm->base.commId, remMeta.qpInfo[0].qpn, comm->remCommId);
+    for (int q = 0; q < comm->base.nqps; q++) {
+      struct ncclIbQpInfo* remQpInfo = remMeta.qpInfo + q;
+      comm->base.qps[q].remDevIdx = remQpInfo->devIndex;
+    }
   }
 
   comm->base.nDataQps = std::max(comm->base.vProps.ndevs, comm->base.nRemDevs);
@@ -2359,15 +2402,6 @@ ib_recv:
   /* copy back the received info */
   memcpy(&remMeta, stage->buffer, sizeof(struct ncclIbConnectionMetadata));
 
-  {
-    char peerStr[SOCKET_NAME_MAXLEN] = "";
-    ncclSocketToString(&rComm->base.sock.addr, peerStr, 1);
-    INFO(NCCL_NET, "NET/ANP/CG: accept ch %d RECV meta: senderCommId=%u "
-         "groupIdx=%u senderQpn=%u senderDev=%s senderPid=%u peerAddr=%s",
-         channelId, remMeta.commId, remMeta.commGroupIdx,
-         remMeta.qpInfo[0].qpn, remMeta.devName, remMeta.senderPid, peerStr);
-  }
-
   // IB setup
   // Pre-declare variables because of goto
   struct ncclIbDev* ibDev;
@@ -2376,6 +2410,9 @@ ib_recv:
   struct ncclIbDevInfo* remDevInfo;
   struct ncclIbQp* qp;
   bool useDmaBuf;
+  bool acceptIsSharedSecondary;
+  struct anpSharedQp* acceptSharedSlot0;
+  anpSharedQpKey acceptLookupKey;
 
   mergedDev = ncclIbMergedDevs + lComm->dev;
   rComm->base.nRemDevs = remMeta.ndevs;
@@ -2386,55 +2423,13 @@ ib_recv:
       mergedDev->devName, rComm->base.vProps.ndevs, remMeta.devName, rComm->base.nRemDevs);
   }
 
-  // Comm grouping setup for accept side
-  rComm->base.inCommGroup = false;
-  rComm->base.isPrimaryComm = false;
-  rComm->base.groupCq = NULL;
-  rComm->base.commGroupIdx = remMeta.commGroupIdx;
-
-  struct anpCommGroup* commGroup;
-  commGroup = NULL;
-  struct anpCommGroupKey lookupKey;
-  memset(&lookupKey, 0, sizeof(lookupKey));
-  if (rcclParamAnpCommNGroups() > 0 && rComm->base.vProps.ndevs > 0) {
-    lookupKey.ibDevN = rComm->base.vProps.devs[0];
-    memcpy(&lookupKey.peerAddr, &rComm->base.sock.addr, sizeof(union ncclSocketAddress));
-    anpStripPort(&lookupKey.peerAddr);
-    lookupKey.peerPid = remMeta.senderPid;
-    lookupKey.isSend = false;
-    lookupKey.groupIdx = remMeta.commGroupIdx;
-
-    commGroup = anpFindCommGroup(&lookupKey);
-    {
-      char addrStr[SOCKET_NAME_MAXLEN] = "";
-      ncclSocketToString(&rComm->base.sock.addr, addrStr, 1);
-      INFO(NCCL_NET, "NET/ANP/CG: accept ch %d lookup: ibDevN=%d localDev=%s peerAddr=%s "
-           "peerPid=%u groupIdx=%d -> %s qpn=%u refcount=%d",
-           channelId, lookupKey.ibDevN,
-           ncclIbDevs[lookupKey.ibDevN].devName,
-           addrStr, lookupKey.peerPid,
-           lookupKey.groupIdx,
-           commGroup ? "REUSE" : "NEW",
-           commGroup ? commGroup->qp->qp_num : 0,
-           commGroup ? commGroup->refcount : 0);
-    }
-  }
-
-  bool isPrimaryComm;
-  isPrimaryComm = (rcclParamAnpCommNGroups() > 0 && rComm->base.vProps.ndevs > 0 && commGroup == NULL);
-
-  // Assign commId for wr_id encoding
-  NCCLCHECKGOTO(anpCommDbEntryAdd(&rComm->base), ret, fail);
-  rComm->base.remCommId = remMeta.commId;
-
   // Metadata to send back to requestor (sender)
   struct ncclIbConnectionMetadata meta;
   memset(&meta, 0, sizeof(meta));
   for (int i = 0; i < rComm->base.vProps.ndevs; i++) {
     rCommDev = rComm->devs + i;
     ibDevN = rComm->base.vProps.devs[i];
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &rCommDev->base, &rComm->base.stats,
-                  isPrimaryComm), ret, fail);
+    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &rCommDev->base, &rComm->base.stats), ret, fail);
     ibDev = ncclIbDevs + ibDevN;
     NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &rCommDev->base.gidInfo.localGidIndex), ret, fail);
     NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, rCommDev->base.gidInfo.localGidIndex, &rCommDev->base.gidInfo.localGid), ret, fail);
@@ -2460,34 +2455,174 @@ ib_recv:
     }
   }
 
+  // Init QP sharing fields
+  rComm->base.commId = 0;
+  rComm->base.isSharedQpPrimary = false;
+  rComm->base.sharedGroupIdx = -1;
+  rComm->base.remIbDevIdx = 0;
+
+  // QP Sharing: determine primary/secondary role on accept side
+  acceptIsSharedSecondary = false;
+  acceptSharedSlot0 = NULL;
+  memset(&acceptLookupKey, 0, sizeof(acceptLookupKey));
+
+  if (rcclParamAnpCommNGroups() > 0) {
+    rComm->base.commId = anpAllocCommId(rComm, false);
+  }
+  if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
+    rComm->base.sharedGroupIdx = remMeta.sharedGroupIdx;
+    rComm->base.remIbDevIdx = remMeta.senderIbDevIdx;
+
+    acceptLookupKey.ibDevN = rComm->base.vProps.devs[0];
+    memcpy(&acceptLookupKey.peerAddr, &rComm->base.sock.addr, sizeof(union ncclSocketAddress));
+    anpStripPort(&acceptLookupKey.peerAddr);
+    acceptLookupKey.remIbDevIdx = remMeta.senderIbDevIdx;
+    acceptLookupKey.isSend = false;
+    acceptLookupKey.groupIdx = remMeta.sharedGroupIdx;
+    acceptLookupKey.qpIdx = 0;
+
+    acceptSharedSlot0 = anpFindSharedQp(&acceptLookupKey);
+  }
+
   // Stripe QP creation across merged devs
   // Make sure to get correct remote peer dev and QP info
   int remDevIndex;
   int devIndex;
-  devIndex = 0;
 
-  if (commGroup) {
-    // Reuse existing comm group QP on accept side
+  if (rcclParamAnpCommNGroups() > 0 && acceptSharedSlot0 != NULL) {
+    // SECONDARY: reuse existing recv QPs
+    acceptIsSharedSecondary = true;
+    int primaryNqps = anpCountGroupQpSlots(&acceptLookupKey.peerAddr,
+        remMeta.senderIbDevIdx, false, remMeta.sharedGroupIdx);
+    rComm->base.sharedPrimaryNqps = primaryNqps;
+
+    anpSharedQpKey secKey;
+    memset(&secKey, 0, sizeof(secKey));
+    memcpy(&secKey.peerAddr, &acceptLookupKey.peerAddr, sizeof(union ncclSocketAddress));
+    secKey.isSend = false;
+    secKey.groupIdx = remMeta.sharedGroupIdx;
+
     for (int q = 0; q < rComm->base.nqps; q++) {
-      qp = rComm->base.qps + q;
-      qp->qp = commGroup->qp;
-      qp->devIndex = commGroup->devIndex;
-      qp->remDevIdx = commGroup->remDevIdx;
-      qp->ctsQpSlot = q;
-      meta.qpInfo[q].qpn = commGroup->qp->qp_num;
-      meta.qpInfo[q].devIndex = commGroup->devIndex;
-      if (commGroup->eceSupported) {
-        meta.qpInfo[q].ece = commGroup->ece;
-        meta.qpInfo[q].ece_supported = commGroup->eceSupported;
+      int mappedQ = q % primaryNqps;
+      int localDevIdx = mappedQ % rComm->base.vProps.ndevs;
+      secKey.ibDevN = rComm->base.vProps.devs[localDevIdx];
+      secKey.remIbDevIdx = remMeta.senderIbDevIdx;
+      secKey.qpIdx = mappedQ;
+
+      struct anpSharedQp* sqe = anpFindSharedQp(&secKey);
+      if (!sqe) {
+        WARN("ANP QP Sharing: accept secondary could not find QP group=%d qpIdx=%d (mapped from %d)",
+             remMeta.sharedGroupIdx, mappedQ, q);
+        return ncclInternalError;
+      }
+      rComm->base.qps[q].qp = sqe->qp;
+      rComm->base.qps[q].devIndex = sqe->devIndex;
+      rComm->base.qps[q].remDevIdx = remMeta.qpInfo[q % remMeta.ndevs].devIndex;
+      rComm->base.qps[q].ctsQpSlot = sqe->ctsQpSlot;
+      sqe->refcount++;
+    }
+    // Redirect CQs to primary's per-device CQs
+    for (int d = 0; d < rComm->base.vProps.ndevs; d++) {
+      secKey.ibDevN = rComm->base.vProps.devs[d];
+      secKey.qpIdx = d;
+      struct anpSharedQp* devEntry = anpFindSharedQp(&secKey);
+      if (devEntry) {
+        wrap_ibv_destroy_cq(rComm->devs[d].base.cq);
+        rComm->devs[d].base.cq = devEntry->primaryCq;
       }
     }
-    rComm->base.inCommGroup = true;
-    rComm->base.isPrimaryComm = false;
-    rComm->base.groupCq = commGroup->cq;
-    commGroup->refcount++;
-    INFO(NCCL_NET, "NET/ANP: accept ch %d reusing comm group QP qpn=%d group=%d (refcount=%d)",
-         channelId, commGroup->qp->qp_num, remMeta.commGroupIdx, commGroup->refcount);
+    acceptSharedSlot0->cqRefcount++;
+
+    // Fill meta for response
+    for (int q = 0; q < rComm->base.nqps; q++) {
+      meta.qpInfo[q].qpn = rComm->base.qps[q].qp->qp_num;
+      meta.qpInfo[q].devIndex = rComm->base.qps[q].devIndex;
+    }
+    meta.commId = rComm->base.commId;
+
+    INFO(NCCL_NET, "ANP QP Sharing: SECONDARY accept ch=%d group=%d commId=%d nqps=%d qpn[0]=%d remQpn[0]=%d",
+         channelId, remMeta.sharedGroupIdx, rComm->base.commId, rComm->base.nqps,
+         meta.qpInfo[0].qpn, remMeta.qpInfo[0].qpn);
+  } else if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
+    // PRIMARY: create QPs with scaled depth
+    rComm->base.isSharedQpPrimary = true;
+    int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
+
+    // Recreate CQs with scaled depth for each device
+    for (int d = 0; d < rComm->base.vProps.ndevs; d++) {
+      int devIbN = rComm->base.vProps.devs[d];
+      wrap_ibv_destroy_cq(rComm->devs[d].base.cq);
+      NCCLCHECKGOTO(anpCreateScaledCq(devIbN, &rComm->devs[d].base.cq, &rComm->base.stats, depthMult), ret, fail);
+    }
+
+    devIndex = 0;
+    for (int q = 0; q < rComm->base.nqps; q++) {
+      remDevIndex = remMeta.qpInfo[q].devIndex;
+      remDevInfo = remMeta.devs + remDevIndex;
+      qp = rComm->base.qps + q;
+      rCommDev = rComm->devs + devIndex;
+      qp->remDevIdx = remDevIndex;
+
+      ibDevN = rComm->devs[devIndex].base.ibDevN;
+      ibDev = ncclIbDevs + ibDevN;
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, qp, channelId, false, q, rComm->base.nqps, depthMult, remMeta.sharedGroupIdx), ret, fail);
+      qp->devIndex = devIndex;
+      devIndex = (devIndex + 1) % rComm->base.vProps.ndevs;
+
+      if (remMeta.qpInfo[q].ece_supported) {
+        // coverity[copy_paste_error]
+        NCCLCHECKGOTO(wrap_ibv_set_ece(qp->qp, &remMeta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+      } else {
+        meta.qpInfo[q].ece_supported = 0;
+      }
+
+      NCCLCHECKGOTO(ncclIbRtrQp(qp->qp, &rCommDev->base.gidInfo, remMeta.qpInfo[q].qpn, remDevInfo, true, remMeta.tc, remMeta.sl), ret, fail);
+      NCCLCHECKGOTO(ncclIbRtsQp(qp->qp), ret, fail);
+
+      if (remMeta.qpInfo[q].ece_supported && meta.qpInfo[q].ece_supported) {
+        NCCLCHECKGOTO(wrap_ibv_query_ece(qp->qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+      }
+
+      meta.qpInfo[q].qpn      = qp->qp->qp_num;
+      meta.qpInfo[q].devIndex  = qp->devIndex;
+
+#ifdef ANP_DEBUG_TRACE_EN
+      INFO(NCCL_NET, "[ANP_TRACE] recvcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d",
+           rComm, qp->channelId, qp->data ? "data" : "cts", qp->qp->qp_num,
+           ibDevN, rComm->base.remDevs[qp->remDevIdx].ibv_dev_index);
+#endif
+    }
+
+    // Register all QP slots in pool
+    for (int q = 0; q < rComm->base.nqps; q++) {
+      int localDevIdx = q % rComm->base.vProps.ndevs;
+
+      anpSharedQpKey regKey;
+      memset(&regKey, 0, sizeof(regKey));
+      memcpy(&regKey.peerAddr, &acceptLookupKey.peerAddr, sizeof(union ncclSocketAddress));
+      regKey.ibDevN = rComm->base.vProps.devs[localDevIdx];
+      regKey.remIbDevIdx = remMeta.senderIbDevIdx;
+      regKey.isSend = false;
+      regKey.groupIdx = remMeta.sharedGroupIdx;
+      regKey.qpIdx = q;
+
+      struct anpSharedQp* entry = anpRegisterSharedQp(&regKey,
+          rComm->base.qps[q].qp, rComm->devs[localDevIdx].base.cq,
+          &rComm->devs[localDevIdx].base, rComm->base.qps[q].devIndex, 1);
+      if (entry) {
+        entry->ctsQpSlot = rComm->base.qps[q].ctsQpSlot;
+        if (q == 0) entry->cqRefcount = 1;
+      }
+    }
+
+    meta.commId = rComm->base.commId;
+
+    INFO(NCCL_NET, "ANP QP Sharing: PRIMARY accept ch=%d group=%d commId=%d nqps=%d depthMult=%d qpn[0]=%d remQpn[0]=%d",
+         channelId, remMeta.sharedGroupIdx, rComm->base.commId, rComm->base.nqps, depthMult,
+         meta.qpInfo[0].qpn, remMeta.qpInfo[0].qpn);
   } else {
+    // NON-SHARING: original QP creation loop
+    devIndex = 0;
     for (int q = 0; q < rComm->base.nqps; q++) {
       remDevIndex = remMeta.qpInfo[q].devIndex;
       remDevInfo = remMeta.devs + remDevIndex;
@@ -2497,9 +2632,7 @@ ib_recv:
 
       ibDevN = rComm->devs[devIndex].base.ibDevN;
       ibDev = ncclIbDevs + ibDevN;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE,
-                    &rComm->base.stats, qp, channelId, false, q, isPrimaryComm,
-                    (int)remMeta.commGroupIdx), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, qp, channelId, false, q, rComm->base.nqps), ret, fail);
       qp->devIndex = devIndex;
       devIndex = (devIndex + 1) % rComm->base.vProps.ndevs;
 
@@ -2517,31 +2650,10 @@ ib_recv:
         NCCLCHECKGOTO(wrap_ibv_query_ece(qp->qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
       }
 #ifdef ANP_DEBUG_TRACE_EN
-      INFO(NCCL_NET, "[ANP_TRACE] recvcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d, isPrimary=%d",
+      INFO(NCCL_NET, "[ANP_TRACE] recvcomm %p, ch %d, %s qp %d, local nic %d, peer nic %d",
            rComm, qp->channelId, qp->data ? "data" : "cts", qp->qp->qp_num,
-           ibDevN, rComm->base.remDevs[qp->remDevIdx].ibv_dev_index, isPrimaryComm);
+           ibDevN, rComm->base.remDevs[qp->remDevIdx].ibv_dev_index);
 #endif
-    }
-
-    // Add primary comm's QP to comm group pool
-    if (isPrimaryComm && rComm->base.nqps > 0) {
-      int ownerDevIdx = rComm->base.qps[0].devIndex;
-      struct anpCommGroup* newCommGroup = anpAddCommGroup(
-          &lookupKey, rComm->base.qps[0].qp, rComm->devs[ownerDevIdx].base.cq,
-          &rComm->devs[ownerDevIdx].base, ownerDevIdx, rComm->base.qps[0].remDevIdx);
-      if (newCommGroup) {
-        if (meta.qpInfo[0].ece_supported) {
-          newCommGroup->ece = meta.qpInfo[0].ece;
-          newCommGroup->eceSupported = meta.qpInfo[0].ece_supported;
-        }
-        rComm->base.inCommGroup = true;
-        rComm->base.isPrimaryComm = true;
-        rComm->base.groupCq = newCommGroup->cq;
-        INFO(NCCL_NET, "NET/ANP: accept ch %d REGISTER comm group recv QP qpn=%d group=%d groupHash=0x%x "
-             "key: ibDevN=%d groupIdx=%d peerPid=%u",
-             channelId, rComm->base.qps[0].qp->qp_num, remMeta.commGroupIdx, newCommGroup->groupHash,
-             lookupKey.ibDevN, lookupKey.groupIdx, lookupKey.peerPid);
-      }
     }
   }
 
@@ -2594,7 +2706,7 @@ ib_recv:
       rCommDev->gpuFlush.sge.addr = (uint64_t)&rComm->gpuFlushHostMem;
       rCommDev->gpuFlush.sge.length = 1;
       rCommDev->gpuFlush.sge.lkey = rCommDev->gpuFlush.hostMr->lkey;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, &rCommDev->gpuFlush.qp, channelId, true, 0xFF), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, &rCommDev->gpuFlush.qp, channelId, true, 0xFF, 1), ret, fail);
       struct ncclIbDevInfo devInfo;
       devInfo.lid         = ibDev->portAttr.lid;
       devInfo.link_layer  = ibDev->portAttr.link_layer;
@@ -2623,13 +2735,15 @@ ib_recv:
   meta.sl = remMeta.sl;
   meta.tc = remMeta.tc;
 
-  for (int q = 0; q < rComm->base.nqps; q++) {
-    meta.qpInfo[q].qpn      = rComm->base.qps[q].qp->qp_num;
-    meta.qpInfo[q].devIndex = rComm->base.qps[q].devIndex;
+  if (!acceptIsSharedSecondary && (rcclParamAnpCommNGroups() == 0 || rComm->base.commId == 0)) {
+    // Non-sharing: fill qpInfo from created QPs (sharing branches set these already)
+    for (int q = 0; q < rComm->base.nqps; q++) {
+      meta.qpInfo[q].qpn      = rComm->base.qps[q].qp->qp_num;
+      meta.qpInfo[q].devIndex = rComm->base.qps[q].devIndex;
+    }
   }
   meta.ndevs = rComm->base.vProps.ndevs;
   meta.isP2p = remMeta.isP2p;
-  meta.commId = rComm->base.commId;
   strncpy(meta.devName, mergedDev->devName, MAX_MERGED_DEV_NAME);
   rComm->base.nDataQps = std::max(rComm->base.vProps.ndevs, rComm->base.nRemDevs);
 
@@ -2675,7 +2789,6 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
       r->sock = NULL;
       memset(r->devBases, 0, sizeof(r->devBases));
       memset(r->events, 0, sizeof(r->events));
-      r->groupRecvDone = true;
       *req = r;
       return ncclSuccess;
     }
@@ -2832,7 +2945,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
   assert(nreqs == 1);
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
 
-  uint64_t wr_id = ((uint64_t)comm->base.commId << 48);
+  uint64_t wr_id = 0ULL;
   for (int r=0; r<nreqs; r++) {
     struct ibv_send_wr* wr = comm->wrs+r;
     memset(wr, 0, sizeof(struct ibv_send_wr));
@@ -2847,20 +2960,29 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
     wr->wr.rdma.remote_addr = 0xdeadbeef;
 #endif
     wr->next = wr + 1;
-    wr_id |= (uint64_t)(reqs[r] - comm->base.reqs) << (r*8);
+    wr_id += (reqs[r] - comm->base.reqs) << (r*8);
     num_write++;
 #ifdef NCCL_ENABLE_NET_PROFILING
     reqs[r]->pInfo[0].nEventHandles = 0;
 #endif
   }
+  // Encode commId in upper 16 bits of wr_id for shared QP completion routing
+  if (rcclParamAnpCommNGroups() > 0) {
+    wr_id |= ((uint64_t)comm->base.commId << 48);
+  }
 
   // Write size as immediate data. In the case of multi-send, only write
   // 0 or 1 as size to indicate whether there was data sent or received.
+  // For shared QPs, imm_data carries receiver's commId + req_idx for completion routing.
   uint32_t immData = 0;
-  bool inCommGroup = comm->base.inCommGroup;
-
   if ((nreqs == 1) && (use_write_op == false)) {
-    immData = reqs[0]->send.size;
+    if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0 && comm->remCommId != 0) {
+      volatile struct ncclIbSendFifo* fifoSlots = comm->fifo[slot];
+      uint8_t recvReqIdx = fifoSlots[0].req_idx;
+      immData = ((uint32_t)recvReqIdx << 16) | (uint32_t)comm->remCommId;
+    } else {
+      immData = reqs[0]->send.size;
+    }
   } else {
     int* sizes = comm->remSizesFifo.elems[slot];
     for (int r=0; r<nreqs; r++) sizes[r] = reqs[r]->send.size;
@@ -2872,7 +2994,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
   if (use_write_op == false) {
       if (nreqs > 1 || (comm->ar && reqs[0]->send.size > ncclParamIbArThreshold())) {
         // When using ADAPTIVE_ROUTING, send the bulk of the data first as an
-        // an RDMA_WRITE, then a 0-byte RDMA_WRITE_WITH_IMM to trigger a remote
+        // RDMA_WRITE, then a 0-byte RDMA_WRITE_WITH_IMM to trigger a remote
         // completion.
         lastWr++;
         memset(lastWr, 0, sizeof(struct ibv_send_wr));
@@ -2887,7 +3009,7 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
       }
       lastWr->wr_id = wr_id;
       lastWr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-      lastWr->imm_data = inCommGroup ? (uint32_t)comm->base.remCommId : immData;
+      lastWr->imm_data = immData;
   } else {
       lastWr->wr_id = wr_id;
   }
@@ -2960,7 +3082,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
     ANP_TELEMETRY_EXECUTE(
         start_time = gettime_ns();
     );
-    NCCLCHECK(wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr));
+    {
+      ncclResult_t postRet = wrap_ibv_post_send(qp->qp, comm->wrs, &bad_wr);
+      if (postRet != ncclSuccess) {
+        WARN("NET/ANP: DATA ibv_post_send FAILED qpn=%u errno=%d (%s)", qp->qp->qp_num, errno, strerror(errno));
+        return postRet;
+      }
+    }
     ANP_TELEMETRY_EXECUTE(
         if (use_write_op) {
           g_debug_stats.num_wr_wqe++;
@@ -3046,7 +3174,7 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void*
       char line[SOCKET_NAME_MAXLEN + 1];
       union ncclSocketAddress addr;
       ncclSocketGetAddr(&comm->base.sock, &addr);
-      WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %d addr %lx rkeys[0]=%x",
+      WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %ld addr %lx rkeys[0]=%x",
         r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
       return ncclInternalError;
     }
@@ -3139,6 +3267,7 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, siz
     localElem[i].nreqs = n;
     localElem[i].size = sizes[i]; // Sanity/Debugging
     localElem[i].tag = tags[i];
+    localElem[i].req_idx = (uint8_t)(req - comm->base.reqs);
     localElem[i].idx = comm->remFifo.fifoTail+1;
   }
   wr.wr.rdma.remote_addr = comm->remFifo.addr + slot*NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbSendFifo);
@@ -3186,12 +3315,22 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, int n, void** data, siz
 #endif
     signalled = true;
     wr.send_flags |= IBV_SEND_SIGNALED;
-    wr.wr_id = ((uint64_t)comm->base.commId << 48) | (uint64_t)(req - comm->base.reqs);
+    wr.wr_id = req - comm->base.reqs;
+    // QP Sharing: encode commId in upper 16 bits for completion routing
+    if (rcclParamAnpCommNGroups() > 0) {
+      wr.wr_id |= ((uint64_t)comm->base.commId << 48);
+    }
     ncclIbAddEvent(req, ctsQp->devIndex, &comm->devs[ctsQp->devIndex].base);
   }
 
   struct ibv_send_wr* bad_wr;
-  NCCLCHECK(wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr));
+  {
+    ncclResult_t postRet = wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr);
+    if (postRet != ncclSuccess) {
+      WARN("NET/ANP: CTS ibv_post_send FAILED qpn=%u errno=%d (%s)", ctsQp->qp->qp_num, errno, strerror(errno));
+      return postRet;
+    }
+  }
 
 #ifdef ANP_DEBUG_TRACE_EN
   INFO(NCCL_VERBS,
@@ -3254,7 +3393,7 @@ ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, size_t* size
 
   struct ibv_recv_wr wr;
   memset(&wr, 0, sizeof(wr));
-  wr.wr_id = ((uint64_t)comm->base.commId << 48) | (uint64_t)(req - comm->base.reqs);
+  wr.wr_id = req - comm->base.reqs;
   wr.sg_list = NULL;
   wr.num_sge = 0;
 
@@ -3267,9 +3406,7 @@ ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, size_t* size
   int qpIndex = comm->base.qpIndex;
   for (int i = 0; i < nqps; i++) {
     struct ncclIbQp* qp = comm->base.qps + comm->base.qpIndex;
-    if (!comm->base.inCommGroup) {
-      ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
-    }
+    ncclIbAddEvent(req, qp->devIndex, &comm->devs[qp->devIndex].base);
 #ifdef NCCL_ENABLE_NET_PROFILING
     // Start a QP event for every request in the multirecv and every qp
     for (int r = 0; r < n; r++) {
@@ -3301,12 +3438,6 @@ ncclResult_t anpNetIrecvDefault(void* recvComm, int n, void** data, size_t* size
     // inside ncclIbPostFifo()
     //comm->base.qpIndex = (comm->base.qpIndex+1)%comm->base.nqps;
     qpIndex = (qpIndex+1)%comm->base.nqps;
-  }
-
-  if (comm->base.inCommGroup) {
-    comm->base.pendingRecvReqs[comm->base.pendingRecvTail % MAX_REQUESTS] = req;
-    comm->base.pendingRecvTail++;
-    req->groupRecvDone = false;
   }
 
   TIME_STOP(1);
@@ -3384,7 +3515,7 @@ ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** 
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     struct ibv_send_wr wr;
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = ((uint64_t)comm->base.commId << 48) | (uint64_t)(req - comm->base.reqs);
+    wr.wr_id = req - comm->base.reqs;
     if (rcclParamIbGdrFlushGpuMemNoRelaxedOrdering()) {
       wr.wr.rdma.remote_addr = (uint64_t)(comm->devs[i].gpuFlush.gpuFlushGpuMem);
       wr.wr.rdma.rkey = comm->devs[i].gpuFlush.gpuMr->rkey;
@@ -3396,7 +3527,7 @@ ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** 
       NCCLCHECK(wrap_ibv_post_send(comm->devs[i].gpuFlush.qp.qp, &wr, &bad_wr));
     }
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = ((uint64_t)comm->base.commId << 48) | (uint64_t)(req - comm->base.reqs);
+    wr.wr_id = req - comm->base.reqs;
     if (rcclParamIbGdrFlushGpuMemNoRelaxedOrdering()) {
       wr.wr.rdma.remote_addr = (uint64_t)(comm->devs[i].gpuFlush.gpuFlushGpuMem);
       wr.wr.rdma.rkey = comm->devs[i].gpuFlush.gpuMr->rkey;
@@ -3421,26 +3552,6 @@ ncclResult_t anpNetFlush(void* recvComm, int n, void** data, int* sizes, void** 
   return ncclSuccess;
 }
 
-static inline ncclResult_t anp_ibv_poll_cq(struct ibv_cq *cq, int num_entries,
-		                                   struct ibv_wc *wc, int* num_done) {
-  /* returns the number of wcs or 0 on success, a negative number otherwise */
-  int done = cq->context->ops.poll_cq(cq, num_entries, wc);
-
-  for (int i=0; i<done; i++) {
-    if (wc[i].status != IBV_WC_SUCCESS) {
-      assert(0);
-      return ncclSystemError;
-    }
-  }
-  if (done < 0) {
-    WARN("Call to ibv_poll_cq() returned %d", done);
-    assert(0);
-    return ncclSystemError;
-  }
-  *num_done = done;
-  return ncclSuccess;
-}
-
 #define ANP_CQ_POLL_MAX_EVENT        16
 #define HCA_NAME(req, index) ((req)->devBases[(index)]->pd->context->device->name)
 
@@ -3454,18 +3565,32 @@ static int getReqQpIndex(struct ncclIbRequest* req, int request, int qpNumber) {
 }
 #endif
 
+static inline ncclResult_t anp_ibv_poll_cq(struct ibv_cq *cq, int num_entries,
+                                           struct ibv_wc *wc, int* num_done) {
+  int done = cq->context->ops.poll_cq(cq, num_entries, wc);
+
+  for (int i=0; i<done; i++) {
+    if (wc[i].status != IBV_WC_SUCCESS) {
+      assert(0);
+      return ncclSystemError;
+    }
+  }
+
+  if (done < 0) {
+    WARN("NET/IB: anp_ibv_poll_cq failed with %d", done);
+    return ncclSystemError;
+  }
+  *num_done = done;
+  return ncclSuccess;
+}
+
 ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
-  if (!r) { WARN("NET/ANP: anpNetTest r is NULL"); return ncclInternalError; }
-  if (!r->base) { WARN("NET/ANP: anpNetTest r->base is NULL r=%p type=%d", r, r->type); return ncclInternalError; }
-  TRACE(NCCL_NET, "NET/ANP: anpNetTest entry r=%p type=%d commId=%u events={%d,%d,%d,%d} inCommGroup=%d",
-        r, r->type, r->base->commId, r->events[0], r->events[1], r->events[2], r->events[3],
-        r->base->inCommGroup);
   while (1) {
     NCCLCHECK(ncclIbStatsCheckFatalCount(&r->base->stats,__func__));
-    bool needGroupRecvPoll = (r->type == NCCL_NET_IB_REQ_RECV && r->base->inCommGroup && !r->groupRecvDone);
-    if (r->events[0] == 0 && r->events[1] == 0 && r->events[2] == 0 && r->events[3] == 0 && !needGroupRecvPoll) {
+    if (r->events[0] == 0 && r->events[1] == 0 && r->events[2] == 0 && r->events[3] == 0) {
+      TRACE(NCCL_NET, "r=%p done", r);
       *done = 1;
       if (sizes && r->type == NCCL_NET_IB_REQ_RECV) {
         for (int i=0; i<r->nreqs; i++) {
@@ -3496,22 +3621,16 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
 
     for (int i = 0; i < NCCL_IB_MAX_DEVS_PER_NIC; i++) {
       TIME_START(3);
-      if (r->events[i] || (needGroupRecvPoll && r->devBases[i])) {
-        // Poll the group's CQ if this comm is in a comm group, otherwise poll own CQ
-        if (!r->base->groupCq && !r->devBases[i]) {
-          WARN("NET/ANP: NULL CQ i=%d events[i]=%d needGroupRecvPoll=%d commId=%u ndevs=%d",
-               i, r->events[i], needGroupRecvPoll, r->base->commId, r->base->vProps.ndevs);
-          return ncclInternalError;
-        }
-        struct ibv_cq* cqToPoll = r->base->groupCq ? r->base->groupCq : r->devBases[i]->cq;
-        // If we expect any completions from this device's CQ
+      // If we expect any completions from this device's CQ
+      if (r->events[i]) {
         if (rcclParamIbAbortOnError()) {
-            NCCLCHECK(anp_ibv_poll_cq(cqToPoll, ANP_CQ_POLL_MAX_EVENT,
-                                      wcs, &wrDone));
+          NCCLCHECK(anp_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                    wcs, &wrDone));
         } else {
-            NCCLCHECK(wrap_ibv_poll_cq(cqToPoll, ANP_CQ_POLL_MAX_EVENT,
-                                       wcs, &wrDone));
+          NCCLCHECK(wrap_ibv_poll_cq(r->devBases[i]->cq, ANP_CQ_POLL_MAX_EVENT,
+                                     wcs, &wrDone));
         }
+
         totalWrDone += wrDone;
         ANP_TELEMETRY_EXECUTE(
             g_anp_state.update_cq_poll_metrics();
@@ -3520,64 +3639,46 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
         if (wrDone == 0) continue;
         for (int w=0; w<wrDone; w++) {
           struct ibv_wc *wc = wcs+w;
-
-          // Decode commId from wr_id for completion routing
-          uint16_t wc_commId = (uint16_t)(wc->wr_id >> 48);
-          uint64_t wc_wr_id_payload = wc->wr_id & 0x0000FFFFFFFFFFFFULL;
-          uint8_t wc_reqIdx = (uint8_t)(wc_wr_id_payload & 0xff);
-
-          // Route to the correct comm's context
-          struct ncclIbNetCommBase* targetBase = r->base;
-          if (wc_commId != r->base->commId) {
-            if (wc_commId < ANP_MAX_COMMS && gCommDb[wc_commId].inUse) {
-              targetBase = gCommDb[wc_commId].base;
-              TRACE(NCCL_NET, "NET/ANP: Routing completion from commId=%u to different comm (caller commId=%u)",
-                    wc_commId, r->base->commId);
-            } else {
-              WARN("NET/ANP: Stale completion for comm %u (wr_id=0x%lx), skipping", wc_commId, wc->wr_id);
-              continue;
-            }
-          }
-
           if (wc->status != IBV_WC_SUCCESS) {
-            // Use the correct comm's context for error reporting
             union ncclSocketAddress addr;
-            ncclSocketGetAddr(&targetBase->sock, &addr);
+            ncclSocketGetAddr(r->sock, &addr);
             char localGidString[INET6_ADDRSTRLEN] = "";
             char remoteGidString[INET6_ADDRSTRLEN] = "";
             const char* localGidStr = NULL, *remoteGidStr = NULL;
-            struct ncclIbNetCommDevBase* errDevBase = r->devBases[i];
-            if (wc_commId != r->base->commId && targetBase != r->base) {
-              errDevBase = ncclIbGetNetCommDevBase(targetBase, i);
-            }
-            if (errDevBase && errDevBase->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) {
-              localGidStr = ibvGetGidStr(&errDevBase->gidInfo.localGid, localGidString, sizeof(localGidString));
-              remoteGidStr = ibvGetGidStr(&targetBase->remDevs[i].remoteGid, remoteGidString, sizeof(remoteGidString));
+            if (r->devBases[i]->gidInfo.link_layer == IBV_LINK_LAYER_ETHERNET) {
+              localGidStr = ibvGetGidStr(&r->devBases[i]->gidInfo.localGid, localGidString, sizeof(localGidString));
+              remoteGidStr = ibvGetGidStr(&r->base->remDevs[i].remoteGid, remoteGidString, sizeof(remoteGidString));
             }
 
             char line[SOCKET_NAME_MAXLEN+1];
-            const char *hcaName = errDevBase ? errDevBase->pd->context->device->name : "unknown";
-            WARN("NET/IB: Got completion from peer %s with status=%d opcode=%d len=%u vendor err %u commId=%u%s%s%s%s hca %s",
-                ncclSocketToString(&addr, line), wc->status, wc->opcode, wc->byte_len, wc->vendor_err, wc_commId,
+            char *hcaName = r->devBases[i]->pd->context->device->name;
+            WARN("NET/IB: Got completion from peer %s with status=%d opcode=%d len=%u vendor err %u (%s)%s%s%s%s hca %s",
+                ncclSocketToString(&addr, line), wc->status, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
                 localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGids":"", remoteGidString, hcaName);
             return ncclRemoteError;
           }
 
-          struct ncclIbRequest* req = targetBase->reqs + wc_reqIdx;
-          if (!req->base) {
-            WARN("NET/ANP: req->base NULL wc_reqIdx=%u commId=%u opcode=%d wr_id=0x%lx",
-                 wc_reqIdx, wc_commId, wc->opcode, (unsigned long)wc->wr_id);
-            return ncclInternalError;
+          union ncclSocketAddress addr;
+          ncclSocketGetAddr(r->sock, &addr);
+
+          // QP Sharing: route completion to correct comm via commId in wr_id upper bits
+          struct ncclIbNetCommBase* targetBase = r->base;
+          if (rcclParamAnpCommNGroups() > 0) {
+            uint16_t wridCommId = (wc->wr_id >> 48) & 0xFFFF;
+            if (wridCommId != 0 && wridCommId < ANP_MAX_COMMS && g_commTable[wridCommId].used) {
+              if (g_commTable[wridCommId].isSend) {
+                targetBase = &((struct ncclIbSendComm*)g_commTable[wridCommId].comm)->base;
+              } else {
+                targetBase = &((struct ncclIbRecvComm*)g_commTable[wridCommId].comm)->base;
+              }
+            }
           }
+          struct ncclIbRequest* req = targetBase->reqs+(wc->wr_id & 0xff);
 
           #ifdef ENABLE_TRACE
-          {
-            union ncclSocketAddress addr;
-            ncclSocketGetAddr(&targetBase->sock, &addr);
-            char line[SOCKET_NAME_MAXLEN+1];
-            TRACE(NCCL_NET, "Got completion from peer %s with status=%d opcode=%d len=%u wr_id=%lu r=%p type=%d events={%d,%d,%d,%d}, i=%d commId=%u",
-                ncclSocketToString(&addr, line), wc->status, wc->opcode,wc->byte_len, wc->wr_id, req, req->type, req->events[0], req->events[1], req->events[2], req->events[3], i, wc_commId);
-          }
+          char line[SOCKET_NAME_MAXLEN+1];
+          TRACE(NCCL_NET, "Got completion from peer %s with status=%d opcode=%d len=%u wr_id=%lu r=%p type=%d events={%d,%d,%d,%d}, i=%d",
+              ncclSocketToString(&addr, line), wc->status, wc->opcode,wc->byte_len, wc->wr_id, req, req->type, req->events[0], req->events[1], req->events[2], req->events[3], i);
           #endif
           if (req && req->type == NCCL_NET_IB_REQ_SEND) {
             ANP_TELEMETRY_EXECUTE(
@@ -3585,20 +3686,18 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
                 g_anp_state.update_wqe_rcvd_metrics(wc->qp_num, wc->wr_id, gettime_ns());
             );
             for (int j = 0; j < req->nreqs; j++) {
-              struct ncclIbRequest* sendReq = targetBase->reqs+((wc_wr_id_payload >> (j*8)) & 0xff);
+              // QP Sharing: use targetBase (routed via commId) instead of r->base
+              struct ncclIbRequest* sendReq = targetBase->reqs+((wc->wr_id >> (j*8)) & 0xff);
               if ((sendReq->events[i] <= 0)) {
                 WARN("NET/IB: sendReq(%p)->events={%d,%d,%d,%d}, i=%d, j=%d <= 0", sendReq, sendReq->events[0], sendReq->events[1], sendReq->events[2], sendReq->events[3], i, j);
                 return ncclInternalError;
               }
               sendReq->events[i]--;
-              TRACE(NCCL_NET, "NET/ANP: send completion commId=%u reqIdx=%u dev=%d events={%d,%d,%d,%d} qpn=%u",
-                    wc_commId, (uint8_t)((wc_wr_id_payload >> (j*8)) & 0xff), i,
-                    sendReq->events[0], sendReq->events[1], sendReq->events[2], sendReq->events[3],
-                    wc->qp_num);
               ANP_TELEMETRY_EXECUTE(
                   g_debug_stats.num_send_completion_ok++;
               );
 #ifdef NCCL_ENABLE_NET_PROFILING
+              // Stop Qp event for sendReq
               int qpIndex = getReqQpIndex(sendReq, j, wc->qp_num);
               NCCLCHECK(ncclProfilerFunction(&sendReq->pInfo[j].qpEventHandles[qpIndex], ncclProfilerNetEventStop, NULL, 0, NULL));
 #endif
@@ -3609,42 +3708,37 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
                 g_debug_stats.num_recv_completion++;
             );
             if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-              if (targetBase->inCommGroup) {
-                // Comm group: the consumed RECV WQE's wr_id may belong to a
-                // different comm than the actual data recipient. Route data
-                // completion via imm_data (sender-controlled, always correct).
-                uint16_t imm_commId = (uint16_t)(wc->imm_data & 0xFFFF);
-                struct ncclIbNetCommBase* recvBase = targetBase;
-                if (imm_commId != wc_commId) {
-                  if (imm_commId < ANP_MAX_COMMS && gCommDb[imm_commId].inUse) {
-                    recvBase = gCommDb[imm_commId].base;
-                    TRACE(NCCL_NET, "NET/ANP: RECV imm_data routing: imm_commId=%u, wr_id_commId=%u",
-                          imm_commId, wc_commId);
-                  } else {
-                    WARN("NET/ANP: RECV imm_data commId=%u invalid (wr_id commId=%u)", imm_commId, wc_commId);
-                    continue;
+              if (rcclParamAnpCommNGroups() > 0) {
+                uint16_t immCommId = wc->imm_data & 0xFFFF;
+                if (immCommId != 0 && immCommId < ANP_MAX_COMMS && g_commTable[immCommId].used) {
+                  // === Shared QP recv path: route via imm_data commId + req_idx ===
+                  uint8_t reqIdx = (wc->imm_data >> 16) & 0xFF;
+                  struct ncclIbRecvComm* targetComm = (struct ncclIbRecvComm*)g_commTable[immCommId].comm;
+
+                  struct ncclIbRequest* targetReq = &targetComm->base.reqs[reqIdx];
+                  if (targetReq->type != NCCL_NET_IB_REQ_RECV) {
+                    WARN("ANP QP Sharing: req_idx=%d type=%d (expected RECV=%d) commId=%d imm_data=0x%x",
+                         reqIdx, targetReq->type, NCCL_NET_IB_REQ_RECV, immCommId, wc->imm_data);
+                    return ncclInternalError;
                   }
+
+                  if (targetReq->nreqs == 1) {
+                    targetReq->recv.sizes[0] = wc->byte_len;
+                  }
+                  targetReq->events[i]--;
+                } else {
+                  // === Shared plugin, but non-shared comm legacy recv path ===
+                  if (req->type != NCCL_NET_IB_REQ_RECV) {
+                    WARN("NET/IB: wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM and req->type=%d", req->type);
+                    return ncclInternalError;
+                  }
+                  if (req->nreqs == 1) {
+                    req->recv.sizes[0] = wc->imm_data;
+                  }
+                  req->events[i]--;
                 }
-                // Mark the correct comm's oldest pending recv as done
-                if (recvBase->pendingRecvHead >= recvBase->pendingRecvTail) {
-                  WARN("NET/ANP: pendingRecvReqs underflow: head=%d tail=%d imm_commId=%u wc_commId=%u wr_id=0x%lx opcode=%d caller_commId=%u req_type=%d",
-                       recvBase->pendingRecvHead, recvBase->pendingRecvTail, imm_commId, wc_commId, wc->wr_id, wc->opcode, r->base->commId, r->type);
-                  continue;
-                }
-                struct ncclIbRequest* recvReq = recvBase->pendingRecvReqs[recvBase->pendingRecvHead % MAX_REQUESTS];
-                if (!recvReq) {
-                  WARN("NET/ANP: recvReq NULL head=%d tail=%d imm_commId=%u wc_commId=%u",
-                       recvBase->pendingRecvHead, recvBase->pendingRecvTail, imm_commId, wc_commId);
-                  recvBase->pendingRecvHead++;
-                  continue;
-                }
-                recvBase->pendingRecvHead++;
-                recvReq->groupRecvDone = true;
-                if (recvReq->nreqs == 1) {
-                  recvReq->recv.sizes[0] = wc->byte_len;
-                }
-                // No events[i]-- here: RECV WQE events are not tracked for comm groups
               } else {
+                // === No sharing: legacy recv path ===
                 if (req->type != NCCL_NET_IB_REQ_RECV) {
                   WARN("NET/IB: wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM and req->type=%d", req->type);
                   return ncclInternalError;
@@ -3655,16 +3749,14 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
                 req->events[i]--;
               }
             } else {
+              // Non-IMM recv (CTS send completion) — use wr_id routed req
               req->events[i]--;
             }
             ANP_TELEMETRY_EXECUTE(
                 g_debug_stats.num_recv_completion_ok++;
             );
-            TRACE(NCCL_NET, "NET/ANP: recv completion commId=%u reqIdx=%u dev=%d events={%d,%d,%d,%d} qpn=%u imm=%u",
-                  wc_commId, wc_reqIdx, i,
-                  req->events[0], req->events[1], req->events[2], req->events[3],
-                  wc->qp_num, (wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) ? wc->imm_data : 0);
 #ifdef NCCL_ENABLE_NET_PROFILING
+            // Stop Qp event for workFifo
             for (int j = 0; j < req->nreqs; j++) {
               int qpIndex = getReqQpIndex(req, j, wc->qp_num);
               NCCLCHECK(ncclProfilerFunction(&req->pInfo[j].qpEventHandles[qpIndex], ncclProfilerNetEventStop, NULL, 0, NULL));
@@ -3679,7 +3771,9 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
     }
 
     // If no CQEs found on any device, return and come back later
-    if (totalWrDone == 0) return ncclSuccess;
+    if (totalWrDone == 0) {
+      return ncclSuccess;
+    }
   }
 }
 
@@ -3688,53 +3782,81 @@ ncclResult_t anpNetCloseSend(void* sendComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
-    struct ncclIbNetCommDevBase* savedPrimaryDevBase = NULL;
-    if (comm->base.inCommGroup) {
+    if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
+      // === Shared QP: refcount-based teardown ===
+      INFO(NCCL_NET, "ANP TEARDOWN: anpNetCloseSend commId=%d nqps=%d ndevs=%d group=%d",
+           comm->base.commId, comm->base.nqps, comm->base.vProps.ndevs, comm->base.sharedGroupIdx);
+      pthread_mutex_lock(&g_sharedQpLock);
+
+      // Build full key for pool lookup (correct for all nqps/ndevs combos)
+      anpSharedQpKey slot0Key;
+      memset(&slot0Key, 0, sizeof(slot0Key));
+      memcpy(&slot0Key.peerAddr, &comm->base.sock.addr, sizeof(union ncclSocketAddress));
+      anpStripPort(&slot0Key.peerAddr);
+      slot0Key.remIbDevIdx = comm->base.remIbDevIdx;
+      slot0Key.isSend = true;
+      slot0Key.groupIdx = comm->base.sharedGroupIdx;
+
       for (int q = 0; q < comm->base.nqps; q++) {
-        if (comm->base.qps[q].qp == NULL) continue;
-        struct anpCommGroup* group = anpFindCommGroupByQpn(comm->base.qps[q].qp->qp_num);
-        if (group) {
-          INFO(NCCL_NET, "NET/ANP: CloseSend commId=%u group=%d QP qpn=%u refcount=%d->%d",
-               comm->base.commId, comm->base.commGroupIdx, comm->base.qps[q].qp->qp_num,
-               group->refcount, group->refcount - 1);
-          group->refcount--;
-          if (group->refcount == 0) {
-            INFO(NCCL_NET, "NET/IB : Destroying comm group send QP qpn=%u dev=%d commId=%u group=%d groupHash=0x%x",
-                 comm->base.qps[q].qp->qp_num, group->ibDevN, comm->base.commId,
-                 comm->base.commGroupIdx, group->groupHash);
-            NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
-            group->qp = NULL;
-            savedPrimaryDevBase = group->primaryDevBase;
-            anpRemoveCommGroup(group);
+        // Use full key lookup instead of QPN (QPN can collide across pool entries)
+        // For secondaries, map q back to primary's range (same as setup)
+        slot0Key.ibDevN = comm->base.vProps.devs[comm->base.qps[q].devIndex];
+        slot0Key.qpIdx = (comm->base.sharedPrimaryNqps > 0)
+                       ? (q % comm->base.sharedPrimaryNqps) : q;
+        struct anpSharedQp* shared = anpFindSharedQp(&slot0Key);
+        if (shared) {
+          INFO(NCCL_NET, "ANP TEARDOWN: send close commId=%d qp[%d] qpn=%u refcount %d->%d %s",
+               comm->base.commId, q, shared->qp->qp_num, shared->refcount, shared->refcount - 1,
+               (shared->refcount == 1) ? "DESTROYING" : "");
+          shared->refcount--;
+          if (shared->refcount == 0) {
+            INFO(NCCL_NET, "ANP QP Sharing: destroying send QP qpn=%u (last ref)", shared->qp->qp_num);
+            NCCLCHECK(wrap_ibv_destroy_qp(shared->qp));
+            shared->qp = NULL;
           }
         } else {
-          INFO(NCCL_NET, "NET/IB : Destroying send QP qpn=%u commId=%u (no comm group entry)",
-               comm->base.qps[q].qp->qp_num, comm->base.commId);
-          NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
+          WARN("ANP TEARDOWN: send close commId=%d qp[%d] qpn=%u NOT FOUND in pool (ibDevN=%d group=%d)",
+               comm->base.commId, q, comm->base.qps[q].qp->qp_num,
+               comm->base.vProps.devs[comm->base.qps[q].devIndex], comm->base.sharedGroupIdx);
         }
       }
+      // Deregister per-comm MRs (NOT shared)
+      for (int i = 0; i < comm->base.vProps.ndevs; i++) {
+        struct ncclIbSendCommDev* commDev = comm->devs + i;
+        if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
+        if (comm->remSizesFifo.mrs[i] != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remSizesFifo.mrs[i]));
+        // Do NOT call ncclIbDestroyBase — CQ and PD are shared
+      }
+      // CQ refcount (tracked on slot-0 entry)
+      slot0Key.ibDevN = comm->base.vProps.devs[0];
+      slot0Key.qpIdx = 0;
+      struct anpSharedQp* slot0 = anpFindSharedQp(&slot0Key);
+      if (slot0) {
+        INFO(NCCL_NET, "ANP TEARDOWN: send close commId=%d group=%d cqRefcount %d->%d %s cq=%p",
+             comm->base.commId, comm->base.sharedGroupIdx,
+             slot0->cqRefcount, slot0->cqRefcount - 1,
+             (slot0->cqRefcount == 1) ? "CLEANUP" : "", (void*)slot0->primaryCq);
+        slot0->cqRefcount--;
+        if (slot0->cqRefcount == 0) {
+          anpCleanupGroupCqs(slot0);
+        }
+      }
+      pthread_mutex_unlock(&g_sharedQpLock);
+      anpFreeCommId(comm->base.commId);
     } else {
+      // === Non-shared: original teardown ===
       for (int q = 0; q < comm->base.nqps; q++) {
-        if (comm->base.qps[q].qp != NULL) {
-          INFO(NCCL_NET, "NET/IB : Destroying send QP qpn=%u dev=%d commId=%u",
-               comm->base.qps[q].qp->qp_num, comm->devs[comm->base.qps[q].devIndex].base.ibDevN, comm->base.commId);
-          NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
-        }
+        INFO(NCCL_NET, "NET/IB : Destroying send QP qpn=%u dev=%d",
+             comm->base.qps[q].qp->qp_num, comm->devs[comm->base.qps[q].devIndex].base.ibDevN);
+        if (comm->base.qps[q].qp != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
       }
-    }
-
-    for (int i = 0; i < comm->base.vProps.ndevs; i++) {
-      struct ncclIbSendCommDev* commDev = comm->devs + i;
-      if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
-      if (comm->remSizesFifo.mrs[i] != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remSizesFifo.mrs[i]));
-      if (!comm->base.isPrimaryComm) {
+      for (int i = 0; i < comm->base.vProps.ndevs; i++) {
+        struct ncclIbSendCommDev* commDev = comm->devs + i;
+        if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
+        if (comm->remSizesFifo.mrs[i] != NULL) NCCLCHECK(wrap_ibv_dereg_mr(comm->remSizesFifo.mrs[i]));
         NCCLCHECK(ncclIbDestroyBase(&commDev->base));
       }
     }
-    if (savedPrimaryDevBase) {
-      NCCLCHECK(ncclIbDestroyBase(savedPrimaryDevBase));
-    }
-    anpCommDbEntryRemove(comm->base.commId);
     free(comm);
   }
   TIME_PRINT("IB");
@@ -3754,68 +3876,115 @@ ncclResult_t anpNetCloseRecv(void* recvComm) {
   if (comm) {
     NCCLCHECK(ncclSocketClose(&comm->base.sock));
 
-    struct ncclIbNetCommDevBase* savedPrimaryDevBase = NULL;
-    if (comm->base.inCommGroup) {
+    if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
+      // === Shared QP: refcount-based teardown ===
+      INFO(NCCL_NET, "ANP TEARDOWN: anpNetCloseRecv commId=%d nqps=%d flushEnabled=%d ndevs=%d group=%d",
+           comm->base.commId, comm->base.nqps, comm->flushEnabled,
+           comm->base.vProps.ndevs, comm->base.sharedGroupIdx);
+      pthread_mutex_lock(&g_sharedQpLock);
+
+      // Build full key for pool lookup (correct for all nqps/ndevs combos)
+      anpSharedQpKey slot0Key;
+      memset(&slot0Key, 0, sizeof(slot0Key));
+      memcpy(&slot0Key.peerAddr, &comm->base.sock.addr, sizeof(union ncclSocketAddress));
+      anpStripPort(&slot0Key.peerAddr);
+      slot0Key.remIbDevIdx = comm->base.remIbDevIdx;
+      slot0Key.isSend = false;
+      slot0Key.groupIdx = comm->base.sharedGroupIdx;
+
       for (int q = 0; q < comm->base.nqps; q++) {
-        if (comm->base.qps[q].qp == NULL) continue;
-        struct anpCommGroup* group = anpFindCommGroupByQpn(comm->base.qps[q].qp->qp_num);
-        if (group) {
-          INFO(NCCL_NET, "NET/ANP: CloseRecv commId=%u group=%d QP qpn=%u refcount=%d->%d",
-               comm->base.commId, comm->base.commGroupIdx, comm->base.qps[q].qp->qp_num,
-               group->refcount, group->refcount - 1);
-          group->refcount--;
-          if (group->refcount == 0) {
-            INFO(NCCL_NET, "NET/IB : Destroying comm group recv QP qpn=%u dev=%d commId=%u group=%d groupHash=0x%x",
-                 comm->base.qps[q].qp->qp_num, group->ibDevN, comm->base.commId,
-                 comm->base.commGroupIdx, group->groupHash);
-            NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
-            group->qp = NULL;
-            savedPrimaryDevBase = group->primaryDevBase;
-            anpRemoveCommGroup(group);
+        // Use full key lookup instead of QPN (QPN can collide across pool entries)
+        // For secondaries, map q back to primary's range (same as setup)
+        slot0Key.ibDevN = comm->base.vProps.devs[comm->base.qps[q].devIndex];
+        slot0Key.qpIdx = (comm->base.sharedPrimaryNqps > 0)
+                       ? (q % comm->base.sharedPrimaryNqps) : q;
+        struct anpSharedQp* shared = anpFindSharedQp(&slot0Key);
+        if (shared) {
+          INFO(NCCL_NET, "ANP TEARDOWN: recv close commId=%d qp[%d] qpn=%u refcount %d->%d %s",
+               comm->base.commId, q, shared->qp->qp_num, shared->refcount, shared->refcount - 1,
+               (shared->refcount == 1) ? "DESTROYING" : "");
+          shared->refcount--;
+          if (shared->refcount == 0) {
+            INFO(NCCL_NET, "ANP QP Sharing: destroying recv QP qpn=%u (last ref)", shared->qp->qp_num);
+            NCCLCHECK(wrap_ibv_destroy_qp(shared->qp));
+            shared->qp = NULL;
           }
         } else {
-          INFO(NCCL_NET, "NET/IB : Destroying recv QP qpn=%u commId=%u (no comm group entry)",
-               comm->base.qps[q].qp->qp_num, comm->base.commId);
-          NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
+          WARN("ANP TEARDOWN: recv close commId=%d qp[%d] qpn=%u NOT FOUND in pool (ibDevN=%d group=%d)",
+               comm->base.commId, q, comm->base.qps[q].qp->qp_num,
+               comm->base.vProps.devs[comm->base.qps[q].devIndex], comm->base.sharedGroupIdx);
         }
       }
+      // Deregister per-comm MRs and flush resources (NOT shared)
+      for (int i = 0; i < comm->base.vProps.ndevs; i++) {
+        struct ncclIbRecvCommDev* commDev = comm->devs + i;
+        if (comm->flushEnabled) {
+          if (commDev->gpuFlush.gpuFlushGpuMem != nullptr) {
+            NCCLCHECK(ncclCudaFree(commDev->gpuFlush.gpuFlushGpuMem));
+            commDev->gpuFlush.gpuFlushGpuMem = nullptr;
+            if (commDev->gpuFlush.gpuMr != nullptr) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.gpuMr));
+            commDev->gpuFlush.gpuMr = nullptr;
+            if (commDev->gpuFlush.dmabuf_fd > 0) { close(commDev->gpuFlush.dmabuf_fd); }
+          }
+          if (commDev->gpuFlush.qp.qp != NULL) {
+            INFO(NCCL_NET, "ANP TEARDOWN: recv close commId=%d destroying gpuFlush qpn=%u send_cq=%p recv_cq=%p dev=%d devCq=%p",
+                 comm->base.commId, commDev->gpuFlush.qp.qp->qp_num,
+                 (void*)commDev->gpuFlush.qp.qp->send_cq, (void*)commDev->gpuFlush.qp.qp->recv_cq,
+                 commDev->base.ibDevN, (void*)commDev->base.cq);
+            NCCLCHECK(wrap_ibv_destroy_qp(commDev->gpuFlush.qp.qp));
+          }
+          if (commDev->gpuFlush.hostMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.hostMr));
+        } else {
+          INFO(NCCL_NET, "ANP TEARDOWN: recv close commId=%d dev=%d flushEnabled=0 (no gpuFlush QP to destroy)",
+               comm->base.commId, commDev->base.ibDevN);
+        }
+        if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
+        if (commDev->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->sizesFifoMr));
+        // Do NOT call ncclIbDestroyBase — CQ and PD are shared
+      }
+      // CQ refcount (tracked on slot-0 entry)
+      slot0Key.ibDevN = comm->base.vProps.devs[0];
+      slot0Key.qpIdx = 0;
+      struct anpSharedQp* slot0 = anpFindSharedQp(&slot0Key);
+      if (slot0) {
+        INFO(NCCL_NET, "ANP TEARDOWN: recv close commId=%d group=%d cqRefcount %d->%d %s cq=%p",
+             comm->base.commId, comm->base.sharedGroupIdx,
+             slot0->cqRefcount, slot0->cqRefcount - 1,
+             (slot0->cqRefcount == 1) ? "CLEANUP" : "", (void*)slot0->primaryCq);
+        slot0->cqRefcount--;
+        if (slot0->cqRefcount == 0) {
+          anpCleanupGroupCqs(slot0);
+        }
+      }
+      pthread_mutex_unlock(&g_sharedQpLock);
+      anpFreeCommId(comm->base.commId);
     } else {
-      for (int q = 0; q < comm->base.nqps; q++) {
-        if (comm->base.qps[q].qp != NULL) {
-          INFO(NCCL_NET, "NET/IB : Destroying recv QP qpn=%u dev=%d commId=%u",
-               comm->base.qps[q].qp->qp_num, comm->devs[comm->base.qps[q].devIndex].base.ibDevN, comm->base.commId);
-          NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
-        }
-      }
-    }
+      // === Non-shared: original teardown ===
+      for (int q = 0; q < comm->base.nqps; q++)
+        if (comm->base.qps[q].qp != NULL) NCCLCHECK(wrap_ibv_destroy_qp(comm->base.qps[q].qp));
 
-    for (int i = 0; i < comm->base.vProps.ndevs; i++) {
-      struct ncclIbRecvCommDev* commDev = comm->devs + i;
-      if (comm->flushEnabled) {
-        if (commDev->gpuFlush.gpuFlushGpuMem != nullptr) {
-          NCCLCHECK(ncclCudaFree(commDev->gpuFlush.gpuFlushGpuMem));
-          commDev->gpuFlush.gpuFlushGpuMem = nullptr;
-          if (commDev->gpuFlush.gpuMr != nullptr) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.gpuMr));
-          commDev->gpuFlush.gpuMr = nullptr;
-          if(commDev->gpuFlush.dmabuf_fd > 0) { close(commDev->gpuFlush.dmabuf_fd);}
+      for (int i = 0; i < comm->base.vProps.ndevs; i++) {
+        struct ncclIbRecvCommDev* commDev = comm->devs + i;
+        if (comm->flushEnabled) {
+          if (commDev->gpuFlush.gpuFlushGpuMem != nullptr) {
+            NCCLCHECK(ncclCudaFree(commDev->gpuFlush.gpuFlushGpuMem));
+            commDev->gpuFlush.gpuFlushGpuMem = nullptr;
+            if (commDev->gpuFlush.gpuMr != nullptr) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.gpuMr));
+            commDev->gpuFlush.gpuMr = nullptr;
+            if (commDev->gpuFlush.dmabuf_fd > 0) { close(commDev->gpuFlush.dmabuf_fd); }
+          }
+          if (commDev->gpuFlush.qp.qp != NULL) {
+            INFO(NCCL_NET, "NET/IB : Destroying gpuFlush QP qpn=%u dev=%d",
+                 commDev->gpuFlush.qp.qp->qp_num, commDev->base.ibDevN);
+            NCCLCHECK(wrap_ibv_destroy_qp(commDev->gpuFlush.qp.qp));
+          }
+          if (commDev->gpuFlush.hostMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.hostMr));
         }
-        if (commDev->gpuFlush.qp.qp != NULL) {
-          INFO(NCCL_NET, "NET/IB : Destroying gpuFlush QP qpn=%u dev=%d commId=%u",
-               commDev->gpuFlush.qp.qp->qp_num, commDev->base.ibDevN, comm->base.commId);
-          NCCLCHECK(wrap_ibv_destroy_qp(commDev->gpuFlush.qp.qp));
-        }
-        if (commDev->gpuFlush.hostMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->gpuFlush.hostMr));
-      }
-      if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
-      if (commDev->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->sizesFifoMr));
-      if (!comm->base.isPrimaryComm) {
+        if (commDev->fifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->fifoMr));
+        if (commDev->sizesFifoMr != NULL) NCCLCHECK(wrap_ibv_dereg_mr(commDev->sizesFifoMr));
         NCCLCHECK(ncclIbDestroyBase(&commDev->base));
       }
     }
-    if (savedPrimaryDevBase) {
-      NCCLCHECK(ncclIbDestroyBase(savedPrimaryDevBase));
-    }
-    anpCommDbEntryRemove(comm->base.commId);
     free(comm);
   }
   return ncclSuccess;

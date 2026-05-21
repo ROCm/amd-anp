@@ -1691,11 +1691,15 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
     qpInitAttr.sq_sig_all &= (~(1 << 17));
   }
   qpInitAttr.sq_sig_all |= (1 << 18);
+  if (groupIdx >= 0) {
+    qpInitAttr.sq_sig_all &= (~(1 << 19));
+  } else {
 #if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-  qpInitAttr.sq_sig_all &= (~(1 << 19));
+    qpInitAttr.sq_sig_all &= (~(1 << 19));
 #else
-  qpInitAttr.sq_sig_all |= (1 << 19);
+    qpInitAttr.sq_sig_all |= (1 << 19);
 #endif
+  }
   // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
   qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS * depthMultiplier;
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS * depthMultiplier;
@@ -2918,11 +2922,12 @@ NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_write_op) {
   uint32_t num_write = 0;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
   int nreqs = slots[0].nreqs;
-#else
-  int nreqs = 1;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+  if (rcclParamAnpCommNGroups() == 0) {
+    nreqs = 1;
+  }
 #endif
   assert(nreqs == 1);
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
@@ -2936,11 +2941,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
     sge->addr=(uintptr_t)reqs[r]->send.data;
     wr->opcode = IBV_WR_RDMA_WRITE;
     wr->send_flags = 0;
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    wr->wr.rdma.remote_addr = slots[r].addr;
-#else
-    wr->wr.rdma.remote_addr = 0xdeadbeef;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+    if (rcclParamAnpCommNGroups() == 0) 
+      wr->wr.rdma.remote_addr = 0xdeadbeef;
+    else
 #endif
+      wr->wr.rdma.remote_addr = slots[r].addr;
+
     wr->next = wr + 1;
     wr_id += (reqs[r] - comm->base.reqs) << (r*8);
     num_write++;
@@ -3010,11 +3017,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
       //ncclIbAddEvent(reqs[r], devIndex, &comm->devs[devIndex].base);
 
       // Select proper rkey (needed even for 0-size send)
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-      comm->wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];
-#else
-      comm->wrs[r].wr.rdma.rkey = 0xbade;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+      if (rcclParamAnpCommNGroups() == 0) 
+        comm->wrs[r].wr.rdma.rkey = 0xbade;
+      else
 #endif
+        comm->wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];
+
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
       int length = std::min(reqs[r]->send.size-reqs[r]->send.offset, chunkSize);
       if (length <= 0) {
@@ -3123,46 +3132,53 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void*
   INFO(NCCL_NET, "Processing send, sendComm %p, size %d, tag %d, use_write_op %d", sendComm, size, tag, use_write_op);
 #endif
   // Wait for the receiver to have posted the corresponding receive
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
-#else
-  int nreqs = 1;
-#endif
   int slot = (comm->fifoHead) % MAX_REQUESTS;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-  slots = comm->fifo[slot];
-  uint64_t idx = comm->fifoHead+1;
-  if (slots[0].idx != idx) {
-      *request = NULL;
-      ANP_TELEMETRY_EXECUTE(
-          g_anp_state.update_slot_miss_metrics(comm->base.qpIndex);
-      );
-      return ncclSuccess;
-  }
-  nreqs = slots[0].nreqs;
-  // Wait until all data has arrived
-  for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
-  __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
-#endif
-  for (int r=0; r<nreqs; r++) {
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    if (reqs[r] != NULL || slots[r].tag != tag) continue;
 
-    if (size > slots[r].size) size = slots[r].size;
-    // Sanity checks
-    if (slots[r].size < 0 || slots[r].addr == 0 || slots[r].rkeys[0] == 0) {
-      char line[SOCKET_NAME_MAXLEN + 1];
-      union ncclSocketAddress addr;
-      ncclSocketGetAddr(&comm->base.sock, &addr);
-      WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %ld addr %lx rkeys[0]=%x",
-        r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
-      return ncclInternalError;
-    }
-#else
-    if (reqs[r] != NULL) continue;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+  if (rcclParamAnpCommNGroups() == 0) {
+    nreqs = 1;
+    slots = NULL;
+  } else
 #endif
+  {
+    slots = comm->fifo[slot];
+    uint64_t idx = comm->fifoHead+1;
+    if (slots[0].idx != idx) {
+        *request = NULL;
+        ANP_TELEMETRY_EXECUTE(
+            g_anp_state.update_slot_miss_metrics(comm->base.qpIndex);
+        );
+        return ncclSuccess;
+    }
+    nreqs = slots[0].nreqs;
+    // Wait until all data has arrived
+    for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
+    __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
+  }
+
+  for (int r=0; r<nreqs; r++) {
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+    if (rcclParamAnpCommNGroups() == 0) {
+      if (reqs[r] != NULL) continue;
+    } else
+#endif
+    {
+      if (reqs[r] != NULL || slots[r].tag != tag) continue;
+
+      if (size > slots[r].size) size = slots[r].size;
+      // Sanity checks
+      if (slots[r].size < 0 || slots[r].addr == 0 || slots[r].rkeys[0] == 0) {
+        char line[SOCKET_NAME_MAXLEN + 1];
+        union ncclSocketAddress addr;
+        ncclSocketGetAddr(&comm->base.sock, &addr);
+        WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %ld addr %lx rkeys[0]=%x",
+          r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
+        return ncclInternalError;
+      }
+    }
 
     struct ncclIbRequest* req;
     NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
@@ -3208,9 +3224,10 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void*
     NCCLCHECK(ncclIbMultiSend(comm, slot, use_write_op));
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+    if (rcclParamAnpCommNGroups() > 0)
 #endif
+      memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
     memset(reqs, 0, NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbRequest*));
     comm->fifoHead++;
     TIME_STOP(0);

@@ -1584,7 +1584,7 @@ static void ncclIbAddEvent(struct ncclIbRequest* req, int devIndex, struct ncclI
   req->events[devIndex]++;
   req->devBases[devIndex] = base;
 }
-ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context) {
+ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base, void* cq_context, int depthMultiplier = 1) {
   base->ibDevN = ibDevN;
   ncclIbDev* ibDev = ncclIbDevs + ibDevN;
   pthread_mutex_lock(&ibDev->lock);
@@ -1602,7 +1602,7 @@ ncclResult_t ncclIbInitCommDevBase(int ibDevN, struct ncclIbNetCommDevBase* base
 
   // CQ is sized to accommodate the max SQ + RQ WQE completions. If each SQ WQE could be signaled, then,
   // for each QP, there can be 2*MAX_REQUESTS completions for SQ and MAX_REQUESTS completions for RQ.
-  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, 3*MAX_REQUESTS*ncclParamIbQpsPerConn(), cq_context, NULL, 0));
+  NCCLCHECK(wrap_ibv_create_cq(&base->cq, ibDev->context, 3*MAX_REQUESTS*ncclParamIbQpsPerConn()*depthMultiplier, cq_context, NULL, 0));
 #ifdef ANP_DEBUG_TRACE_EN
   INFO(NCCL_NET, "[ANP_TRACE] Created cq, ibDevN %d, handle %u, fd %d, refcount %d, cqe %d", ibDevN, base->cq->handle,
        base->cq->channel ? base->cq->channel->fd : -1,
@@ -1626,13 +1626,6 @@ returning:
   return res;
 }
 
-// Create a CQ with scaled depth for shared QP primaries
-static ncclResult_t anpCreateScaledCq(int ibDevN, struct ibv_cq** cq, void* cq_context, int depthMultiplier) {
-    ncclIbDev* ibDev = ncclIbDevs + ibDevN;
-    int cqDepth = 3 * MAX_REQUESTS * ncclParamIbQpsPerConn() * depthMultiplier;
-    NCCLCHECK(wrap_ibv_create_cq(cq, ibDev->context, cqDepth, cq_context, NULL, 0));
-    return ncclSuccess;
-}
 
 // Print a one-shot sharing summary for a given peer direction.
 // Called on the first isend/irecv; the `printed` flag on slot-0 prevents repeats.
@@ -1656,6 +1649,7 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   qpInitAttr.send_cq = base->cq;
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
+  // groupIdx >=0 will be true only for QP create for a shared comm group
   if (groupIdx >= 0) {
     uint8_t mask = (groupIdx % 2 == 0) ? IONIC_UDMA_MASK_LOW : IONIC_UDMA_MASK_HIGH;
     wrap_ibv_pd_set_udma_mask(base->pd, mask);
@@ -1691,11 +1685,15 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
     qpInitAttr.sq_sig_all &= (~(1 << 17));
   }
   qpInitAttr.sq_sig_all |= (1 << 18);
+  if (groupIdx >= 0) {
+    qpInitAttr.sq_sig_all &= (~(1 << 19));
+  } else {
 #if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-  qpInitAttr.sq_sig_all &= (~(1 << 19));
+    qpInitAttr.sq_sig_all &= (~(1 << 19));
 #else
-  qpInitAttr.sq_sig_all |= (1 << 19);
+    qpInitAttr.sq_sig_all |= (1 << 19);
 #endif
+  }
   // We might send 2 messages per send (RDMA and RDMA_WITH_IMM)
   qpInitAttr.cap.max_send_wr = 2*MAX_REQUESTS * depthMultiplier;
   qpInitAttr.cap.max_recv_wr = MAX_REQUESTS * depthMultiplier;
@@ -1896,10 +1894,12 @@ ib_recv_dev_list:
     g_anp_state.set_device_name(dev, "", mergedDev->devName);
   );
   // Init PD, Ctx for each IB device
+  int depthMult;
+  depthMult = (rcclParamAnpCommNGroups() > 0) ? std::max((int64_t)1, rcclParamAnpQpDepthMultiplier()) : 1;
   comm->ar = 1; // Set to 1 for logic
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     int ibDevN = comm->base.vProps.devs[i];
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats), ret, fail);
+    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &comm->devs[i].base, &comm->base.stats, depthMult), ret, fail);
     comm->ar = comm->ar && ncclIbDevs[ibDevN].ar; // ADAPTIVE_ROUTING - if all merged devs have it enabled
   }
 
@@ -2008,14 +2008,6 @@ ib_recv_dev_list:
   if (rcclParamAnpCommNGroups() > 0 && !isSharedSecondary) {
     // PRIMARY: create QPs with scaled depth
     comm->base.isSharedQpPrimary = true;
-    int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
-
-    // Recreate CQs with scaled depth for each device
-    for (int d = 0; d < comm->base.vProps.ndevs; d++) {
-      int ibDevN = comm->base.vProps.devs[d];
-      wrap_ibv_destroy_cq(comm->devs[d].base.cq);
-      NCCLCHECKGOTO(anpCreateScaledCq(ibDevN, &comm->devs[d].base.cq, &comm->base.stats, depthMult), ret, fail);
-    }
 
     int devIndex = 0;
     for (int q = 0; q < comm->base.nqps; q++) {
@@ -2409,10 +2401,12 @@ ib_recv:
   // Metadata to send back to requestor (sender)
   struct ncclIbConnectionMetadata meta;
   memset(&meta, 0, sizeof(meta));
+  int depthMult;
+  depthMult = (rcclParamAnpCommNGroups() > 0) ? std::max((int64_t)1, rcclParamAnpQpDepthMultiplier()) : 1;
   for (int i = 0; i < rComm->base.vProps.ndevs; i++) {
     rCommDev = rComm->devs + i;
     ibDevN = rComm->base.vProps.devs[i];
-    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &rCommDev->base, &rComm->base.stats), ret, fail);
+    NCCLCHECKGOTO(ncclIbInitCommDevBase(ibDevN, &rCommDev->base, &rComm->base.stats, depthMult), ret, fail);
     ibDev = ncclIbDevs + ibDevN;
     NCCLCHECKGOTO(ncclIbGetGidIndex(ibDev->context, ibDev->portNum, &ibDev->portAttr, &rCommDev->base.gidInfo.localGidIndex), ret, fail);
     NCCLCHECKGOTO(wrap_ibv_query_gid(ibDev->context, ibDev->portNum, rCommDev->base.gidInfo.localGidIndex, &rCommDev->base.gidInfo.localGid), ret, fail);
@@ -2529,14 +2523,6 @@ ib_recv:
   } else if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
     // PRIMARY: create QPs with scaled depth
     rComm->base.isSharedQpPrimary = true;
-    int depthMult = std::max((int64_t)1, rcclParamAnpQpDepthMultiplier());
-
-    // Recreate CQs with scaled depth for each device
-    for (int d = 0; d < rComm->base.vProps.ndevs; d++) {
-      int devIbN = rComm->base.vProps.devs[d];
-      wrap_ibv_destroy_cq(rComm->devs[d].base.cq);
-      NCCLCHECKGOTO(anpCreateScaledCq(devIbN, &rComm->devs[d].base.cq, &rComm->base.stats, depthMult), ret, fail);
-    }
 
     devIndex = 0;
     for (int q = 0; q < rComm->base.nqps; q++) {
@@ -2918,11 +2904,12 @@ NCCL_PARAM(IbSplitDataOnQps, "IB_SPLIT_DATA_ON_QPS", 0);
 ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_write_op) {
   uint32_t num_write = 0;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   volatile struct ncclIbSendFifo* slots = comm->fifo[slot];
   int nreqs = slots[0].nreqs;
-#else
-  int nreqs = 1;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+  if (rcclParamAnpCommNGroups() == 0) {
+    nreqs = 1;
+  }
 #endif
   assert(nreqs == 1);
   if (nreqs > NCCL_NET_IB_MAX_RECVS) return ncclInternalError;
@@ -2936,11 +2923,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
     sge->addr=(uintptr_t)reqs[r]->send.data;
     wr->opcode = IBV_WR_RDMA_WRITE;
     wr->send_flags = 0;
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    wr->wr.rdma.remote_addr = slots[r].addr;
-#else
-    wr->wr.rdma.remote_addr = 0xdeadbeef;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+    if (rcclParamAnpCommNGroups() == 0) 
+      wr->wr.rdma.remote_addr = 0xdeadbeef;
+    else
 #endif
+      wr->wr.rdma.remote_addr = slots[r].addr;
+
     wr->next = wr + 1;
     wr_id += (reqs[r] - comm->base.reqs) << (r*8);
     num_write++;
@@ -3010,11 +2999,13 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot, bool use_wri
       //ncclIbAddEvent(reqs[r], devIndex, &comm->devs[devIndex].base);
 
       // Select proper rkey (needed even for 0-size send)
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-      comm->wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];
-#else
-      comm->wrs[r].wr.rdma.rkey = 0xbade;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+      if (rcclParamAnpCommNGroups() == 0) 
+        comm->wrs[r].wr.rdma.rkey = 0xbade;
+      else
 #endif
+        comm->wrs[r].wr.rdma.rkey = slots[r].rkeys[qp->remDevIdx];
+
       int chunkSize = DIVUP(DIVUP(reqs[r]->send.size, nqps), align) * align;
       int length = std::min(reqs[r]->send.size-reqs[r]->send.offset, chunkSize);
       if (length <= 0) {
@@ -3123,46 +3114,53 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void*
   INFO(NCCL_NET, "Processing send, sendComm %p, size %d, tag %d, use_write_op %d", sendComm, size, tag, use_write_op);
 #endif
   // Wait for the receiver to have posted the corresponding receive
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
   int nreqs = 0;
   volatile struct ncclIbSendFifo* slots;
-#else
-  int nreqs = 1;
-#endif
   int slot = (comm->fifoHead) % MAX_REQUESTS;
   struct ncclIbRequest** reqs = comm->fifoReqs[slot];
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-  slots = comm->fifo[slot];
-  uint64_t idx = comm->fifoHead+1;
-  if (slots[0].idx != idx) {
-      *request = NULL;
-      ANP_TELEMETRY_EXECUTE(
-          g_anp_state.update_slot_miss_metrics(comm->base.qpIndex);
-      );
-      return ncclSuccess;
-  }
-  nreqs = slots[0].nreqs;
-  // Wait until all data has arrived
-  for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
-  __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
-#endif
-  for (int r=0; r<nreqs; r++) {
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    if (reqs[r] != NULL || slots[r].tag != tag) continue;
 
-    if (size > slots[r].size) size = slots[r].size;
-    // Sanity checks
-    if (slots[r].size < 0 || slots[r].addr == 0 || slots[r].rkeys[0] == 0) {
-      char line[SOCKET_NAME_MAXLEN + 1];
-      union ncclSocketAddress addr;
-      ncclSocketGetAddr(&comm->base.sock, &addr);
-      WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %ld addr %lx rkeys[0]=%x",
-        r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
-      return ncclInternalError;
-    }
-#else
-    if (reqs[r] != NULL) continue;
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+  if (rcclParamAnpCommNGroups() == 0) {
+    nreqs = 1;
+    slots = NULL;
+  } else
 #endif
+  {
+    slots = comm->fifo[slot];
+    uint64_t idx = comm->fifoHead+1;
+    if (slots[0].idx != idx) {
+        *request = NULL;
+        ANP_TELEMETRY_EXECUTE(
+            g_anp_state.update_slot_miss_metrics(comm->base.qpIndex);
+        );
+        return ncclSuccess;
+    }
+    nreqs = slots[0].nreqs;
+    // Wait until all data has arrived
+    for (int r=1; r<nreqs; r++) while(slots[r].idx != idx);
+    __sync_synchronize(); // order the nreqsPtr load against tag/rkey/addr loads below
+  }
+
+  for (int r=0; r<nreqs; r++) {
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+    if (rcclParamAnpCommNGroups() == 0) {
+      if (reqs[r] != NULL) continue;
+    } else
+#endif
+    {
+      if (reqs[r] != NULL || slots[r].tag != tag) continue;
+
+      if (size > slots[r].size) size = slots[r].size;
+      // Sanity checks
+      if (slots[r].size < 0 || slots[r].addr == 0 || slots[r].rkeys[0] == 0) {
+        char line[SOCKET_NAME_MAXLEN + 1];
+        union ncclSocketAddress addr;
+        ncclSocketGetAddr(&comm->base.sock, &addr);
+        WARN("NET/IB : req %d/%d tag %x peer %s posted incorrect receive info: size %ld addr %lx rkeys[0]=%x",
+          r, nreqs, tag, ncclSocketToString(&addr, line), slots[r].size, slots[r].addr, slots[r].rkeys[0]);
+        return ncclInternalError;
+      }
+    }
 
     struct ncclIbRequest* req;
     NCCLCHECK(ncclIbGetRequest(&comm->base, &req));
@@ -3208,9 +3206,10 @@ ncclResult_t anpNetIsend(void* sendComm, void* data, size_t size, int tag, void*
     NCCLCHECK(ncclIbMultiSend(comm, slot, use_write_op));
 
     // Clear slots[0]->nreqs, as well as other fields to help debugging and sanity checks
-#if !defined(CTS_RCVR_OFFLOAD_ENABLED)
-    memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
+#if defined(CTS_RCVR_OFFLOAD_ENABLED)
+    if (rcclParamAnpCommNGroups() > 0)
 #endif
+      memset((void*)slots, 0, sizeof(struct ncclIbSendFifo));
     memset(reqs, 0, NCCL_NET_IB_MAX_RECVS*sizeof(struct ncclIbRequest*));
     comm->fifoHead++;
     TIME_STOP(0);

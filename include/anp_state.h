@@ -38,6 +38,17 @@
 #define IS_POWER_OF_2(number) \
     ((number > 0) && !(number & (number - 1)))
 
+// Resolve a path to its canonical form and validate it is safe to use.
+// Returns the canonical path on success, or an empty string on failure.
+static inline std::string sanitize_path(const std::string& path) {
+    if (path.empty()) return "";
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved) == nullptr) {
+        return "";
+    }
+    return std::string(resolved);
+}
+
 struct qp_status_s {
     bool data_qp;
 };
@@ -502,7 +513,11 @@ public:
         const char* config_file_env = std::getenv("RCCL_ANP_CONFIG_FILE");
 
         if (config_file_env != NULL) {
-            anp_config_file_path = std::string(config_file_env);
+            anp_config_file_path = sanitize_path(std::string(config_file_env));
+            if (anp_config_file_path.empty()) {
+                ANP_LOG_ERROR("RCCL_ANP_CONFIG_FILE path is invalid or does not exist: %s",
+                              config_file_env);
+            }
         }
         ANP_LOG_VERBOSE("config_json %s", anp_config_file_path.c_str());
         // try to open the config file
@@ -523,8 +538,14 @@ public:
                     anp_logger::log_level = LOG_VERBOSE;
                 else
                     anp_logger::log_level = LOG_ERROR;
-                // read the output_dir
-                output_dir = pt.get("output_dir", "/tmp");
+                // read the output_dir and sanitize it
+                std::string raw_output_dir = pt.get("output_dir", "/tmp");
+                output_dir = sanitize_path(raw_output_dir);
+                if (output_dir.empty()) {
+                    ANP_LOG_ERROR("output_dir path is invalid or does not exist: %s, "
+                                  "falling back to /tmp", raw_output_dir.c_str());
+                    output_dir = "/tmp";
+                }
                 // histogram bucket_interval_ns is expected to be in power of 2.
                 // read the value and if it input is not a power of 2, adjust it to next power of 2.
                 size_t bucket_interval_ns = pt.get<size_t>("bucket_interval_ns", 1024);

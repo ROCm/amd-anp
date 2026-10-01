@@ -20,12 +20,32 @@
 
 import json
 import os
+import signal
+import tempfile
 import time
 import threading
 import curses
-import subprocess
 
-FILES = [f"/tmp/device_status_{i}.json" for i in range(8)]
+
+def get_output_dir():
+    """Resolve the ANP output directory from the config file, matching the C++ plugin behavior."""
+    config_path = os.environ.get("RCCL_ANP_CONFIG_FILE", "")
+    if config_path:
+        config_path = os.path.realpath(config_path)
+        try:
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            output_dir = config.get("output_dir", "")
+            if output_dir:
+                output_dir = os.path.realpath(output_dir)
+                if os.path.isdir(output_dir):
+                    return output_dir
+        except Exception:
+            pass
+    return tempfile.gettempdir()
+
+
+FILES = [os.path.join(get_output_dir(), f"device_status_{i}.json") for i in range(8)]
 UPDATE_INTERVAL = 1
 
 device_index = 0
@@ -69,10 +89,8 @@ def plot_device_status(stdscr):
         if device:
             process_id = device["devices"][0]["status"]["process_id"]
             if os.path.exists(f"/proc/{process_id}"):
-                subprocess.run(["kill", "-USR1", str(process_id)], check=True)
-                subprocess.run(["sync"], check=True)
-                subprocess.run(["sync"], check=True)
-                subprocess.run(["sync"], check=True)
+                os.kill(int(process_id), signal.SIGUSR1)
+                os.sync()
                 time.sleep(1)
 
 

@@ -27,9 +27,18 @@
 #include <boost/version.hpp>
 #include "anp_metrics.h"
 
+// Serializes all telemetry access: every proxy thread updates g_anp_state and
+// g_debug_stats, and snapshots share qp_info_s objects with the live state.
+// Heap-allocated and never freed so it outlives g_anp_state's destructor at exit.
+inline std::mutex& anp_telemetry_mutex() {
+    static std::mutex* m = new std::mutex;
+    return *m;
+}
+
 #ifdef ANP_TELEMETRY_ENABLED
     #define TELEMETRY_STATUS "enabled"
-    #define ANP_TELEMETRY_EXECUTE(stmt) do { stmt; } while (0)
+    #define ANP_TELEMETRY_EXECUTE(stmt) \
+        do { std::lock_guard<std::mutex> anp_telemetry_lk(anp_telemetry_mutex()); stmt; } while (0)
 #else
     #define TELEMETRY_STATUS "disabled"
     #define ANP_TELEMETRY_EXECUTE(stmt)
@@ -598,7 +607,11 @@ public:
             ANP_LOG_ERROR("json output directory not specified");
             return;
         }
-        to_json(root);
+        {
+            // a snapshot's qp_info_s objects are shared with g_anp_state
+            std::lock_guard<std::mutex> lk(anp_telemetry_mutex());
+            to_json(root);
+        }
 
 	std::ofstream ofs(tmp_path);
         if (!ofs.is_open()) {

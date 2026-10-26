@@ -30,6 +30,7 @@
 
 #include <assert.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -295,7 +296,11 @@ void anp_create_json_thread(void) {
     pthread_t thread_id;
     pthread_attr_t attr;
     struct sched_param param;
-    anp_state* snapshot = new anp_state(g_anp_state);
+    anp_state* snapshot;
+    {
+        std::lock_guard<std::mutex> lk(anp_telemetry_mutex());
+        snapshot = new anp_state(g_anp_state);
+    }
 
     pthread_attr_init(&attr);
     // detached thread
@@ -320,12 +325,37 @@ void anp_create_json_thread(void) {
 #endif
 }
 
+#ifdef ANP_TELEMETRY_ENABLED
+// SIGUSR1 only posts this semaphore (async-signal-safe); the snapshot allocates
+// and takes the telemetry lock, so it runs on anp_dump_thread_main instead.
+static sem_t g_anpDumpSem;
+
+static void* anp_dump_thread_main(void*) {
+  while (true) {
+    if (sem_wait(&g_anpDumpSem) == 0) anp_create_json_thread();
+  }
+  return nullptr;
+}
+
+static void anp_start_dump_thread(void) {
+  pthread_t tid;
+  sem_init(&g_anpDumpSem, 0, 0);
+  if (pthread_create(&tid, NULL, anp_dump_thread_main, NULL) != 0) {
+    ANP_LOG_ERROR("Failed to create telemetry dump thread");
+    return;
+  }
+  pthread_detach(tid);
+}
+#endif
+
 void anp_sig_handler(int signum) {
   ANP_LOG_VERBOSE("Process ID: %d, Thread ID: %lu, signal: %s (%u)",
                   getpid(), pthread_self(), strsignal(signum), signum);
 
   if (signum == SIGUSR1) {
-    anp_create_json_thread();
+#ifdef ANP_TELEMETRY_ENABLED
+    sem_post(&g_anpDumpSem);
+#endif
     return;
   } else if (signum == SIGUSR2) {
     anp_reinit_debug_log();
@@ -335,6 +365,11 @@ void anp_sig_handler(int signum) {
 
 void anp_register_signal_hdl(void) {
     std::vector<int> signalsToCatch = {SIGUSR1, SIGUSR2};
+
+#ifdef ANP_TELEMETRY_ENABLED
+    static pthread_once_t dumpThreadOnce = PTHREAD_ONCE_INIT;
+    pthread_once(&dumpThreadOnce, anp_start_dump_thread);
+#endif
 
     for (auto signum : signalsToCatch) {
       if (signal(signum, anp_sig_handler) == SIG_ERR)
@@ -1308,9 +1343,9 @@ struct anpSharedQp {
 
 // Global comm table for completion routing (commId → comm pointer)
 struct anpCommTableEntry {
-    void*    comm;          // ncclIbSendComm* or ncclIbRecvComm*
+    void*    comm;          // ncclIbSendComm* or ncclIbRecvComm*; NULL when free. Read with
+                            // __atomic_load_n: other comms' threads route completions through it.
     bool     isSend;
-    bool     used;
 };
 
 // Pool and comm table globals
@@ -1425,9 +1460,8 @@ static uint16_t anpAllocCommId(void* comm, bool isSend) {
         return 0;
     }
     uint16_t id = g_nextCommId++;
-    g_commTable[id].comm = comm;
     g_commTable[id].isSend = isSend;
-    g_commTable[id].used = true;
+    __atomic_store_n(&g_commTable[id].comm, comm, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_sharedQpLock);
     return id;
 }
@@ -1436,8 +1470,7 @@ static uint16_t anpAllocCommId(void* comm, bool isSend) {
 static void anpFreeCommId(uint16_t commId) {
     if (commId > 0 && commId < ANP_MAX_COMMS) {
         pthread_mutex_lock(&g_sharedQpLock);
-        g_commTable[commId].used = false;
-        g_commTable[commId].comm = NULL;
+        __atomic_store_n(&g_commTable[commId].comm, (void*)NULL, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&g_sharedQpLock);
     }
 }
@@ -1736,9 +1769,8 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   NCCLCHECK(wrap_ibv_modify_qp(qp->qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS));
   INFO(NCCL_NET, "NET/IB : ncclIbCreateQp port=%d dev=%d devName=%s ndevs=%d nmdevs=%d qpn=%u pkey=%u pd=%p",
     ib_port, base->ibDevN, ncclIbDevs[base->ibDevN].devName, ncclNIbDevs, ncclNMergedIbDevs, qp->qp->qp_num, qpAttr.pkey_index, base->pd);
-  ANP_TELEMETRY_EXECUTE(
-      anp_create_json_thread();
-  );
+  // takes the telemetry lock itself, so not inside ANP_TELEMETRY_EXECUTE
+  anp_create_json_thread();
   if (dataQP == false) {
     qp->ctsQpSlot = qp_idx;
   } else {
@@ -1941,6 +1973,9 @@ ib_recv_dev_list:
 
   if (rcclParamAnpCommNGroups() > 0) {
     comm->base.commId = anpAllocCommId(comm, true);
+    // Hold the pool lock from lookup through registration so two comms
+    // connecting to the same peer cannot both become primary for a group.
+    pthread_mutex_lock(&g_sharedQpLock);
   }
   if (rcclParamAnpCommNGroups() > 0 && comm->base.commId != 0) {
     // Build probe key to count existing comms to this peer
@@ -1995,6 +2030,7 @@ ib_recv_dev_list:
         struct anpSharedQp* sqe = anpFindSharedQp(&secKey);
         if (!sqe) {
           WARN("ANP QP Sharing: secondary could not find QP group=%d qpIdx=%d (mapped from %d)", groupIdx, mappedQ, q);
+          pthread_mutex_unlock(&g_sharedQpLock);
           return ncclInternalError;
         }
         comm->base.qps[q].qp = sqe->qp;
@@ -2033,12 +2069,12 @@ ib_recv_dev_list:
     for (int q = 0; q < comm->base.nqps; q++) {
       ncclIbSendCommDev* commDev = comm->devs + devIndex;
       ncclIbDev* ibDev = ncclIbDevs + commDev->base.ibDevN;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q, channelId, true, q, comm->base.nqps, depthMult, groupIdx), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &commDev->base, IBV_ACCESS_REMOTE_WRITE, &comm->base.stats, comm->base.qps + q, channelId, true, q, comm->base.nqps, depthMult, groupIdx), ret, fail_shared_unlock);
       comm->base.qps[q].devIndex = devIndex;
       meta.qpInfo[q].qpn      = comm->base.qps[q].qp->qp_num;
       meta.qpInfo[q].devIndex = comm->base.qps[q].devIndex;
       if (ncclParamIbEceEnable()) {
-        NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+        NCCLCHECKGOTO(wrap_ibv_query_ece(comm->base.qps[q].qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail_shared_unlock);
       } else {
         meta.qpInfo[q].ece_supported = 0;
       }
@@ -2093,6 +2129,7 @@ ib_recv_dev_list:
       devIndex = (devIndex + 1) % comm->base.vProps.ndevs;
     }
   }
+  if (rcclParamAnpCommNGroups() > 0) pthread_mutex_unlock(&g_sharedQpLock);
 
   for (int i = 0; i < comm->base.vProps.ndevs; i++) {
     ncclIbSendCommDev* commDev = comm->devs + i;
@@ -2268,6 +2305,8 @@ exit:
   if (stage->buffer) free(stage->buffer);
   stage->state = ncclIbCommStateStart;
   return ret;
+fail_shared_unlock:
+  pthread_mutex_unlock(&g_sharedQpLock);
 fail:
   free(comm);
   goto exit;
@@ -2464,6 +2503,8 @@ ib_recv:
     rComm->base.commId = anpAllocCommId(rComm, false);
   }
   if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) {
+    // Held from lookup through registration; see ncclIbConnect.
+    pthread_mutex_lock(&g_sharedQpLock);
     rComm->base.sharedGroupIdx = remMeta.sharedGroupIdx;
     rComm->base.remIbDevIdx = remMeta.senderIbDevIdx;
 
@@ -2507,6 +2548,7 @@ ib_recv:
       if (!sqe) {
         WARN("ANP QP Sharing: accept secondary could not find QP group=%d qpIdx=%d (mapped from %d)",
              remMeta.sharedGroupIdx, mappedQ, q);
+        pthread_mutex_unlock(&g_sharedQpLock);
         return ncclInternalError;
       }
       rComm->base.qps[q].qp = sqe->qp;
@@ -2551,22 +2593,22 @@ ib_recv:
 
       ibDevN = rComm->devs[devIndex].base.ibDevN;
       ibDev = ncclIbDevs + ibDevN;
-      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, qp, channelId, false, q, rComm->base.nqps, depthMult, remMeta.sharedGroupIdx), ret, fail);
+      NCCLCHECKGOTO(ncclIbCreateQp(ibDev->portNum, &rCommDev->base, IBV_ACCESS_REMOTE_WRITE, &rComm->base.stats, qp, channelId, false, q, rComm->base.nqps, depthMult, remMeta.sharedGroupIdx), ret, fail_shared_unlock);
       qp->devIndex = devIndex;
       devIndex = (devIndex + 1) % rComm->base.vProps.ndevs;
 
       if (remMeta.qpInfo[q].ece_supported) {
         // coverity[copy_paste_error]
-        NCCLCHECKGOTO(wrap_ibv_set_ece(qp->qp, &remMeta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+        NCCLCHECKGOTO(wrap_ibv_set_ece(qp->qp, &remMeta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail_shared_unlock);
       } else {
         meta.qpInfo[q].ece_supported = 0;
       }
 
-      NCCLCHECKGOTO(ncclIbRtrQp(qp->qp, &rCommDev->base.gidInfo, remMeta.qpInfo[q].qpn, remDevInfo, true, remMeta.tc, remMeta.sl), ret, fail);
-      NCCLCHECKGOTO(ncclIbRtsQp(qp->qp), ret, fail);
+      NCCLCHECKGOTO(ncclIbRtrQp(qp->qp, &rCommDev->base.gidInfo, remMeta.qpInfo[q].qpn, remDevInfo, true, remMeta.tc, remMeta.sl), ret, fail_shared_unlock);
+      NCCLCHECKGOTO(ncclIbRtsQp(qp->qp), ret, fail_shared_unlock);
 
       if (remMeta.qpInfo[q].ece_supported && meta.qpInfo[q].ece_supported) {
-        NCCLCHECKGOTO(wrap_ibv_query_ece(qp->qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail);
+        NCCLCHECKGOTO(wrap_ibv_query_ece(qp->qp, &meta.qpInfo[q].ece, &meta.qpInfo[q].ece_supported), ret, fail_shared_unlock);
       }
 
       meta.qpInfo[q].qpn      = qp->qp->qp_num;
@@ -2642,6 +2684,7 @@ ib_recv:
 #endif
     }
   }
+  if (rcclParamAnpCommNGroups() > 0 && rComm->base.commId != 0) pthread_mutex_unlock(&g_sharedQpLock);
 
   useDmaBuf  = (ncclIbDmaBufSupport(lComm->dev) == ncclSuccess);
   rComm->flushEnabled = ((ncclIbGdrSupport() == ncclSuccess || useDmaBuf)
@@ -2762,6 +2805,8 @@ exit:
   stage->comm = NULL;
   stage->buffer = NULL;
   return ret;
+fail_shared_unlock:
+  pthread_mutex_unlock(&g_sharedQpLock);
 fail:
   free(rComm);
   goto exit;
@@ -3664,11 +3709,13 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
           struct ncclIbNetCommBase* targetBase = r->base;
           if (rcclParamAnpCommNGroups() > 0) {
             uint16_t wridCommId = (wc->wr_id >> 48) & 0xFFFF;
-            if (wridCommId != 0 && wridCommId < ANP_MAX_COMMS && g_commTable[wridCommId].used) {
+            void* wridComm = (wridCommId != 0 && wridCommId < ANP_MAX_COMMS)
+                           ? __atomic_load_n(&g_commTable[wridCommId].comm, __ATOMIC_ACQUIRE) : NULL;
+            if (wridComm) {
               if (g_commTable[wridCommId].isSend) {
-                targetBase = &((struct ncclIbSendComm*)g_commTable[wridCommId].comm)->base;
+                targetBase = &((struct ncclIbSendComm*)wridComm)->base;
               } else {
-                targetBase = &((struct ncclIbRecvComm*)g_commTable[wridCommId].comm)->base;
+                targetBase = &((struct ncclIbRecvComm*)wridComm)->base;
               }
             }
           }
@@ -3709,10 +3756,11 @@ ncclResult_t anpNetTest(void* request, int* done, int* sizes) {
             if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
               if (rcclParamAnpCommNGroups() > 0) {
                 uint16_t immCommId = wc->imm_data & 0xFFFF;
-                if (immCommId != 0 && immCommId < ANP_MAX_COMMS && g_commTable[immCommId].used) {
+                struct ncclIbRecvComm* targetComm = (immCommId != 0 && immCommId < ANP_MAX_COMMS)
+                    ? (struct ncclIbRecvComm*)__atomic_load_n(&g_commTable[immCommId].comm, __ATOMIC_ACQUIRE) : NULL;
+                if (targetComm) {
                   // === Shared QP recv path: route via imm_data commId + req_idx ===
                   uint8_t reqIdx = (wc->imm_data >> 16) & 0xFF;
-                  struct ncclIbRecvComm* targetComm = (struct ncclIbRecvComm*)g_commTable[immCommId].comm;
 
                   struct ncclIbRequest* targetReq = &targetComm->base.reqs[reqIdx];
                   if (targetReq->type != NCCL_NET_IB_REQ_RECV) {

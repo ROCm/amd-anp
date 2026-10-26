@@ -1653,6 +1653,12 @@ static channel_ud_t data_channel_ud[128];
 static bool data_last_ud[128];
 static channel_ud_t channel_ud[128];
 static bool last_ud[128];
+// The udma mask is state on the per-device PD that every comm in the process
+// shares, and it only applies to the next queue created on that PD. Hold this
+// from pipeline selection through ibv_create_qp so another comm's proxy thread
+// cannot change the mask in between (QP lands on the wrong pipeline). Also
+// guards the *_ud tables above.
+static pthread_mutex_t udmaLock = PTHREAD_MUTEX_INITIALIZER;
 
 ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
                             int access_flags, void* qp_context, struct ncclIbQp* qp,
@@ -1664,6 +1670,7 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
   qpInitAttr.send_cq = base->cq;
   qpInitAttr.recv_cq = base->cq;
   qpInitAttr.qp_type = IBV_QPT_RC;
+  pthread_mutex_lock(&udmaLock);
   // groupIdx >=0 will be true only for QP create for a shared comm group
   if (groupIdx >= 0) {
     uint8_t mask = (groupIdx % 2 == 0) ? IONIC_UDMA_MASK_LOW : IONIC_UDMA_MASK_HIGH;
@@ -1719,7 +1726,9 @@ ncclResult_t ncclIbCreateQp(uint8_t ib_port, struct ncclIbNetCommDevBase* base,
 #else
   qpInitAttr.cap.max_inline_data = ncclParamIbUseInline() ? sizeof(struct ncclIbSendFifo) : 0;
 #endif
-  NCCLCHECK(wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr));
+  ncclResult_t createRes = wrap_ibv_create_qp(&qp->qp, base->pd, &qpInitAttr);
+  pthread_mutex_unlock(&udmaLock);
+  NCCLCHECK(createRes);
   INFO(NCCL_NET, "ANP QP Created: qpn=%u requested send_wr=%d recv_wr=%d, granted send_wr=%d recv_wr=%d depthMult=%d",
        qp->qp->qp_num, 2*MAX_REQUESTS*depthMultiplier, MAX_REQUESTS*depthMultiplier,
        qpInitAttr.cap.max_send_wr, qpInitAttr.cap.max_recv_wr, depthMultiplier);

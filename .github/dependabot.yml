@@ -9,16 +9,25 @@ updates:
   - package-ecosystem: "github-actions"
     # "/" covers .github/workflows; composite actions keep their own `uses:`
     # pins, so .github/actions has to be listed separately to get bumped.
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "daily"
-      # Wait a week before adopting newly released action versions.
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    # Wait a week before adopting newly released action versions.
+    # ROCm security actions are excluded from the cooldown.
     cooldown:
       default-days: 7
       exclude:
         - "ROCm/rocm-security-gh*"
     groups:
       rocm-security-gh:
-        patterns: ["ROCm/rocm-security-gh*"]
+        patterns:
+          - "ROCm/rocm-security-gh*"
       github-actions:
-        patterns: ["*"]
+        patterns:
+          - "*"

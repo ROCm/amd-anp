@@ -13,12 +13,21 @@ updates:
       - "/"
       - "/.github/actions/*"
     schedule:
-      interval: "weekly"
+      interval: "daily"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "chore"
       include: "scope"
+    # Wait a week before adopting newly released action versions.
+    # ROCm security actions are excluded from the cooldown.
+    cooldown:
+      default-days: 7
+      exclude:
+        - "ROCm/rocm-security-gh*"
     groups:
+      rocm-security-gh:
+        patterns:
+          - "ROCm/rocm-security-gh*"
       github-actions:
         patterns:
           - "*"
